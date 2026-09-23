@@ -127,18 +127,64 @@ def _raw_info(raw: rawpy.RawPy, preview: Image.Image | None = None) -> RawInfo:
 def read_raw_info(path: str | Path) -> RawInfo:
     """Read camera/lens metadata and an embedded preview without full demosaicing."""
     with rawpy.imread(str(path)) as raw:
-        preview: Image.Image | None = None
-        try:
-            thumb = raw.extract_thumb()
-            if thumb.format == rawpy.ThumbFormat.JPEG:
-                from io import BytesIO
-
-                preview = Image.open(BytesIO(thumb.data)).convert("RGB")
-            elif thumb.format == rawpy.ThumbFormat.BITMAP:
-                preview = Image.fromarray(thumb.data).convert("RGB")
-        except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError):
-            pass
+        preview = _extract_raw_preview(raw)
         return _raw_info(raw, preview)
+
+
+def _extract_raw_preview(raw: rawpy.RawPy) -> Image.Image | None:
+    """Return the embedded camera-rendered preview when the RAW contains one."""
+    try:
+        thumb = raw.extract_thumb()
+    except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError):
+        return None
+    if thumb.format == rawpy.ThumbFormat.JPEG:
+        preview = Image.open(BytesIO(thumb.data)).convert("RGB")
+    elif thumb.format == rawpy.ThumbFormat.BITMAP:
+        preview = Image.fromarray(thumb.data).convert("RGB")
+    else:
+        return None
+    return ImageOps.exif_transpose(preview)
+
+
+def _preview_linear_luminance_median(preview: Image.Image) -> float:
+    """Measure the embedded preview's median luminance in linear sRGB."""
+    profile = preview.info.get("icc_profile")
+    if profile:
+        try:
+            preview = ImageCms.profileToProfile(
+                preview,
+                ImageCms.ImageCmsProfile(BytesIO(profile)),
+                ImageCms.createProfile("sRGB"),
+                outputMode="RGB",
+            )
+        except Exception:
+            preview = preview.convert("RGB")
+    rgb = np.asarray(preview.convert("RGB"), dtype=np.float32) / 255.0
+    low = rgb <= 0.04045
+    rgb[low] /= 12.92
+    rgb[~low] = np.power((rgb[~low] + 0.055) / 1.055, 2.4)
+    luminance = rgb @ np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    return float(np.median(luminance))
+
+
+def _linear_rgb_luminance_median(rgb: np.ndarray) -> float:
+    """Measure median luminance of a linear sRGB buffer."""
+    if rgb.ndim != 3 or rgb.shape[2] < 3 or rgb.size == 0:
+        return 0.0
+    luminance = rgb[..., :3].astype(np.float32, copy=False) @ np.asarray(
+        [0.2126, 0.7152, 0.0722], dtype=np.float32
+    )
+    return float(np.median(luminance))
+
+
+def _preview_exposure_shift(source_median: float, preview_median: float) -> float:
+    """Return LibRaw's supported exposure multiplier that matches preview midtones."""
+    if not math.isfinite(source_median) or not math.isfinite(preview_median):
+        return 1.0
+    if source_median <= 1e-8 or preview_median <= 1e-8:
+        return 1.0
+    # LibRaw's exp_shift range is 0.25 (−2 EV) through 8 (＋3 EV).
+    return float(np.clip(preview_median / source_median, 0.25, 8.0))
 
 
 def _detector_image(raw: rawpy.RawPy) -> tuple[np.ndarray, int]:
@@ -609,7 +655,6 @@ def _soften_stars(
         color_fraction /= max(float(np.sum(color_fraction)), 1e-12)
         color_max = max(float(np.max(color_fraction)), 1e-12)
         source_peak = float(np.max(core_signal))
-        amplitude = source_peak * (color_fraction / color_max) * sky_gain
         prepared.append({
             "star": star,
             "cx": cx,
@@ -622,26 +667,35 @@ def _soften_stars(
             "inner_mask_radius": 3.0 * probe_sigma,
             "outer_mask_radius": 4.0 * probe_sigma,
             "background": local_background,
-            "amplitude": amplitude,
+            "source_peak": source_peak,
             "color_fraction": color_fraction,
         })
 
-    # For a Gaussian profile I(r)=I0*exp(-r²/(2σ²)), a fixed isophote has
-    # radius proportional to sqrt(log(I0/I_threshold)). Use the faintest
-    # selected aperture flux as that threshold; the mapping is strictly
-    # monotonic in measured SEP brightness and gives the faintest star min_radius.
+    # Match the magnitude-based response used by the earlier 18ffa10 build:
+    # delta magnitude is logarithmic in measured flux, then maps linearly to
+    # radius. A square-root response made most stars cluster near max_radius.
     flux_floor = min(float(item["star"].flux) for item in prepared)
+    brightest_flux = max(float(item["star"].flux) for item in prepared)
     max_log_flux = max(
-        (math.log(max(float(item["star"].flux), 1e-20) / max(flux_floor, 1e-20)) for item in prepared),
-        default=0.0,
+        math.log(max(brightest_flux, 1e-20) / max(flux_floor, 1e-20)),
+        0.0,
     )
-    max_log_flux = max(max_log_flux, 0.0)
+    reference_peak = max(float(item["source_peak"]) for item in prepared)
     for item in prepared:
-        log_flux = max(math.log(max(float(item["star"].flux), 1e-20) / max(flux_floor, 1e-20)), 0.0)
-        response = math.sqrt(log_flux / max_log_flux) if max_log_flux > 1e-12 else 1.0
+        star = item["star"]
+        log_flux = max(math.log(max(float(star.flux), 1e-20) / max(flux_floor, 1e-20)), 0.0)
+        response = float(np.clip(log_flux / max_log_flux, 0.0, 1.0)) if max_log_flux > 1e-12 else 1.0
         radius = min_radius + (max_radius - min_radius) * response
         diffusion_sigma = (radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 40.0)
-        star = item["star"]
+        # A star's halo peak follows its measured SEP aperture flux. Using the
+        # brightest selected core as the radiometric reference keeps the halo
+        # in the developed image's units while reducing faint-star intensity.
+        flux_scale = float(np.clip(star.relative_flux_ratio, 0.0, 1.0))
+        color_fraction = np.asarray(item["color_fraction"])
+        color_max = max(float(np.max(color_fraction)), 1e-12)
+        item["amplitude"] = (
+            reference_peak * flux_scale * (color_fraction / color_max) * sky_gain
+        )
         # The added scattering wing has its own circular Gaussian width. The
         # original, possibly imperfect stellar core remains unmodified below.
         output_sigma = diffusion_sigma
@@ -650,7 +704,8 @@ def _soften_stars(
         item["sigma"] = output_sigma
         item["inner_mask_radius"] = max(1.0, 3.0 * output_sigma)
         item["outer_mask_radius"] = max(float(item["inner_mask_radius"]) + 1.0, 4.0 * output_sigma)
-        item["isophote_radius_response"] = response
+        item["radius_response"] = response
+        item["halo_flux_scale"] = flux_scale
         cx, cy = float(item["cx"]), float(item["cy"])
         center_x, center_y = int(np.clip(round(cx), 0, out_w - 1)), int(np.clip(round(cy), 0, out_h - 1))
         extent = int(math.ceil(float(item["outer_mask_radius"])))
@@ -687,9 +742,10 @@ def _soften_stars(
             "y_px": round(cy, 2),
             "aperture_flux": round(float(star.flux), 7),
             "relative_flux_ratio": round(float(star.relative_flux_ratio), 6),
-            "radius_curve": "Gaussian fixed-flux isophote; sqrt(log(aperture_flux/faintest_selected_flux))",
+            "radius_curve": "linear response to relative stellar magnitude; log(aperture_flux/faintest_selected_flux)",
             "source_signal_to_noise": round(float(star.signal_to_noise), 3),
-            "radius_response": round(float(item["isophote_radius_response"]), 5),
+            "radius_response": round(float(item["radius_response"]), 5),
+            "halo_flux_scale": round(float(item["halo_flux_scale"]), 6),
             "fwhm_px": round(float(star.fwhm * (scale_x + scale_y) * 0.5), 3),
             "halo_radius_3sigma_px": round(3.0 * float(item["sigma"]), 2),
             "diffusion_sigma_px": round(float(item["diffusion_sigma"]), 3),
@@ -746,6 +802,9 @@ def process_raw(
             progress(percent, message)
 
     report(2, "正在读取图像与镜头信息…")
+    raw_preview_median: float | None = None
+    raw_linear_median: float | None = None
+    raw_exposure_shift = 1.0
     if input_path.suffix.lower() in {".tif", ".tiff", ".jpg", ".jpeg"}:
         raster = _read_raster(input_path)
         info = raster.info
@@ -781,16 +840,38 @@ def process_raw(
         if input_path.suffix.lower() not in raw_extensions:
             raise ValueError("请选择相机 RAW、TIFF 或 JPG 文件。")
         with rawpy.imread(str(input_path)) as raw:
-            info = _raw_info(raw)
+            preview = _extract_raw_preview(raw)
+            info = _raw_info(raw, preview)
             if metadata_callback:
                 metadata_callback(info)
             detector, _factor = _detector_image(raw)
             report(12, "正在识别星点与测量亮度…")
             stars, candidate_count, selected_count, sky_background_level = detect_stars(detector, sensitivity, star_count_limit)
-            report(36, f"SEP 找到 {candidate_count:,} 个点源，选取最亮的 {selected_count:,} 个，正在解码 RAW…")
+            if preview is not None:
+                raw_preview_median = _preview_linear_luminance_median(preview)
+                report(36, "正在按相机内嵌预览校准 RAW 曝光…")
+                calibration_rgb = raw.postprocess(
+                    gamma=(1, 1),
+                    no_auto_bright=True,
+                    output_bps=16,
+                    output_color=rawpy.ColorSpace.sRGB,
+                    use_camera_wb=True,
+                    demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+                    half_size=True,
+                )
+                calibration_float = calibration_rgb.astype(np.float32)
+                np.divide(calibration_float, 65535.0, out=calibration_float)
+                raw_linear_median = _linear_rgb_luminance_median(calibration_float)
+                del calibration_rgb, calibration_float
+                raw_exposure_shift = _preview_exposure_shift(
+                    raw_linear_median, raw_preview_median
+                )
+            report(43, f"SEP 找到 {candidate_count:,} 个点源，选取最亮的 {selected_count:,} 个，正在解码 RAW…")
             rgb = raw.postprocess(
                 gamma=(1, 1),
                 no_auto_bright=True,
+                exp_shift=raw_exposure_shift,
+                exp_preserve_highlights=1.0,
                 output_bps=16,
                 output_color=rawpy.ColorSpace.sRGB,
                 use_camera_wb=True,
@@ -809,7 +890,7 @@ def process_raw(
         invert_gray = False
         photometric = tifffile.PHOTOMETRIC.RGB
         input_kind = "RAW"
-        encoding = "RAW developed to linear sRGB; sRGB ICC profile embedded"
+        encoding = "RAW developed to linear sRGB with embedded-preview median exposure matching and highlight preservation; sRGB ICC profile embedded"
 
     report(63, "图像解码完成，按星点亮度与 PSF 形状柔化…")
     star_measurements = _soften_stars(
@@ -849,7 +930,8 @@ def process_raw(
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
         "star_selection": "top N by SEP circular aperture flux; no catalog magnitude calibration",
         "soft_focus": "circular isotropic Gaussian wings with circular smoothstep feather mask; blend wing opacity over original pixels while retaining original star cores",
-        "brightness_to_radius_curve": "Gaussian fixed-flux isophote: sqrt(log(star_flux/faintest_selected_flux)) normalized to brightest selected star; monotonic in SEP aperture flux; min/max radius bounds apply",
+        "brightness_to_radius_curve": "linear response to relative stellar magnitude: log(aperture_flux/faintest_selected_flux) normalized to brightest selected star, matching 18ffa10 mapping",
+        "brightness_to_halo_strength_curve": "halo peak scales linearly with SEP aperture-flux ratio to the brightest selected star; faint stars receive smaller halos as well as smaller radii",
         "soft_focus_strength": round(strength, 1),
         "soft_focus_strength_note": "diffusion variance ratio relative to strength 40; default strength 10, maximum 30; diffusion sigma scales as sqrt(strength/40)",
         "soft_focus_opacity_percent": round(opacity, 1),
@@ -862,6 +944,10 @@ def process_raw(
         "star_photometry_and_halo_parameters": star_measurements,
         "encoding": encoding,
         "input_color_profile": profile_description,
+        "raw_preview_available": input_kind == "RAW" and info.preview is not None,
+        "raw_embedded_preview_median_luminance_linear": round(raw_preview_median, 7) if raw_preview_median is not None else None,
+        "raw_unadjusted_median_luminance_linear": round(raw_linear_median, 7) if raw_linear_median is not None else None,
+        "raw_exposure_shift_from_embedded_preview": round(raw_exposure_shift, 5) if input_kind == "RAW" else None,
     }
     temporary = output_path.with_name(output_path.stem + ".writing" + output_path.suffix)
     try:
