@@ -39,6 +39,7 @@ class Star:
     flux: float
     peak: float
     fwhm: float
+    relative_flux_ratio: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,8 @@ class ProcessResult:
     output_path: str
     star_count: int
     candidate_count: int
+    eligible_count: int
+    relative_brightness_floor: float
     width: int
     height: int
     camera: str
@@ -144,9 +147,9 @@ def _detector_image(raw: rawpy.RawPy) -> tuple[np.ndarray, int]:
 def detect_stars(
     detector: np.ndarray,
     sensitivity: float,
-    max_stars: int = 50,
-) -> tuple[list[Star], int]:
-    """Use SEP extraction and aperture photometry, returning the brightest point sources."""
+    relative_brightness_floor: float = 0.063,
+) -> tuple[list[Star], int, int]:
+    """Return bright SEP point sources above a relative aperture-flux floor."""
     data = np.ascontiguousarray(detector, dtype=np.float32)
     background = sep.Background(data, bw=64, bh=64, fw=3, fh=3)
     signal = np.ascontiguousarray(data - background.back(), dtype=np.float32)
@@ -161,7 +164,7 @@ def detect_stars(
         clean=True,
     )
     if len(first_pass) == 0:
-        return [], 0
+        return [], 0, 0
 
     first_major = np.maximum(first_pass["a"], first_pass["b"])
     first_minor = np.minimum(first_pass["a"], first_pass["b"])
@@ -203,7 +206,7 @@ def detect_stars(
         segmentation_map=False,
     )
     if len(objects) == 0:
-        return [], 0
+        return [], 0, 0
 
     major = np.maximum(objects["a"], objects["b"])
     minor = np.minimum(objects["a"], objects["b"])
@@ -223,7 +226,7 @@ def detect_stars(
     )
     indices = np.flatnonzero(point_source)
     if len(indices) == 0:
-        return [], 0
+        return [], 0, 0
 
     # SEP's isophotal flux is useful for extraction. Circular aperture flux is
     # measured separately so the brightness ordering includes more of each PSF.
@@ -241,10 +244,15 @@ def detect_stars(
     indices = indices[good]
     flux = flux[good]
     if len(indices) == 0:
-        return [], 0
+        return [], 0, 0
 
     candidate_count = int(len(indices))
-    order = np.argsort(flux)[::-1][: max(1, int(max_stars))]
+    brightest_flux = float(np.max(flux))
+    relative_flux = flux / max(brightest_flux, 1e-20)
+    eligible = relative_flux >= float(np.clip(relative_brightness_floor, 0.0, 1.0))
+    eligible_count = int(np.count_nonzero(eligible))
+    eligible_indices = np.flatnonzero(eligible)
+    order = eligible_indices[np.argsort(flux[eligible_indices])[::-1]]
     stars = [
         Star(
             float(objects["x"][indices[i]]),
@@ -252,10 +260,11 @@ def detect_stars(
             float(flux[i]),
             float(objects["peak"][indices[i]]),
             float(2.354820045 * moment_size[indices[i]]),
+            float(relative_flux[i]),
         )
         for i in order
     ]
-    return stars, candidate_count
+    return stars, candidate_count, eligible_count
 
 
 def _soften_stars(
@@ -264,25 +273,25 @@ def _soften_stars(
     detector_shape: tuple[int, int],
     min_radius: float,
     max_radius: float,
+    relative_brightness_floor: float,
     strength: float,
     progress: Progress | None = None,
-) -> list[dict[str, float]]:
+) -> list[dict[str, object]]:
     if not stars or strength <= 0:
         return []
     out_h, out_w = linear_rgb.shape[:2]
     det_h, det_w = detector_shape
     xs = np.asarray([star.flux for star in stars], dtype=np.float64)
-    log_flux = np.log10(np.maximum(xs, 1e-20))
-    low, high = np.percentile(log_flux, [10, 99])
-    if high <= low:
-        levels = np.linspace(0.0, 1.0, len(stars), dtype=np.float32)
-    else:
-        levels = np.clip((log_flux - low) / (high - low), 0.0, 1.0).astype(np.float32)
-
     order = np.argsort(xs)[::-1]
-    records: list[dict[str, float]] = []
+    records: list[dict[str, object]] = []
     scale_x = out_w / det_w
     scale_y = out_h / det_h
+    span_limit = -2.5 * math.log10(max(relative_brightness_floor, 1e-12))
+    if span_limit <= 1e-12:
+        span_limit = max(
+            (-2.5 * math.log10(max(star.relative_flux_ratio, 1e-20)) for star in stars),
+            default=0.0,
+        )
     prepared: list[tuple[Star, float, float, np.ndarray, np.ndarray]] = []
     for star in stars:
         cx = (star.x + 0.5) * scale_x - 0.5
@@ -300,7 +309,12 @@ def _soften_stars(
 
     for index, position in enumerate(order):
         star, cx, cy, color_peak, center_rgb = prepared[int(position)]
-        brightness = float(levels[int(position)]) ** 0.85
+        relative_delta = -2.5 * math.log10(max(star.relative_flux_ratio, 1e-20))
+        brightness = (
+            1.0
+            if span_limit <= 1e-12
+            else float(np.clip(1.0 - relative_delta / span_limit, 0.0, 1.0))
+        )
         radius = float(min_radius + brightness * (max_radius - min_radius))
         sigma = max(radius / 3.0, 0.65)
         extent = max(2, int(math.ceil(3.0 * sigma)))
@@ -321,19 +335,26 @@ def _soften_stars(
             yy, xx = np.ogrid[y0:y1, x0:x1]
             distance2 = (xx - cx) ** 2 + (yy - cy) ** 2
             gaussian = np.exp(-0.5 * distance2 / (sigma * sigma)).astype(np.float32)
-            halo_scale = float(np.clip(0.55 + 0.35 * brightness, 0.0, 0.9)) * strength
-            # Ensure the Gaussian layer cannot lift the centroid pixel itself.
-            halo_peak = np.minimum(color_peak, center_rgb / max(halo_scale, 1e-8)) * halo_scale
+            # Keep the Gaussian peak no brighter than the measured centroid.
+            halo_peak = np.minimum(color_peak, center_rgb)
             halo = gaussian[..., None] * halo_peak.astype(np.float32)[None, None, :]
             patch = linear_rgb[y0:y1, x0:x1, :]
-            np.maximum(patch, halo, out=patch)
+            # Alpha-composite the Lighten layer over the base image.
+            np.subtract(halo, patch, out=halo)
+            np.maximum(halo, 0.0, out=halo)
+            patch += float(np.clip(strength, 0.0, 0.3)) * halo
             records.append(
                 {
                     "x_px": round(float(cx), 2),
                     "y_px": round(float(cy), 2),
                     "aperture_flux": round(float(star.flux), 7),
+                    "relative_flux_ratio": round(float(star.relative_flux_ratio), 6),
+                    "relative_delta_mag_from_brightest": round(
+                        float(-2.5 * math.log10(max(star.relative_flux_ratio, 1e-20))), 3
+                    ),
                     "fwhm_px": round(float(star.fwhm * (scale_x + scale_y) * 0.5), 3),
                     "halo_radius_px": round(radius, 2),
+                    "halo_linear_rgb_peak": [round(float(value), 6) for value in halo_peak],
                 }
             )
         if progress and (index == len(order) - 1 or index % max(1, len(order) // 20) == 0):
@@ -364,10 +385,10 @@ def process_raw(
     output_path: str | Path,
     *,
     sensitivity: float = 4.8,
-    strength: float = 0.55,
+    strength: float = 10.0,
+    relative_brightness_floor: float = 0.063,
     min_radius: float = 3.0,
     max_radius: float = 32.0,
-    max_stars: int = 50,
     progress: Progress | None = None,
     metadata_callback: MetadataCallback | None = None,
 ) -> ProcessResult:
@@ -379,6 +400,7 @@ def process_raw(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if max_radius < min_radius:
         min_radius, max_radius = max_radius, min_radius
+    relative_brightness_floor = float(np.clip(relative_brightness_floor, 0.0, 1.0))
 
     def report(percent: int, message: str) -> None:
         if progress:
@@ -391,8 +413,13 @@ def process_raw(
             metadata_callback(info)
         detector, _factor = _detector_image(raw)
         report(12, "正在识别星点与测量亮度…")
-        stars, candidate_count = detect_stars(detector, sensitivity, max_stars)
-        report(35, f"SEP 找到 {candidate_count:,} 个点源候选，选取最亮的 {len(stars):,} 颗，正在解码 RAW…")
+        stars, candidate_count, eligible_count = detect_stars(
+            detector, sensitivity, relative_brightness_floor
+        )
+        report(
+            35,
+            f"SEP 找到 {candidate_count:,} 个点源候选，{eligible_count:,} 个达到门限，全部纳入柔焦处理，正在解码 RAW…",
+        )
         rgb = raw.postprocess(
             gamma=(1, 1),
             no_auto_bright=True,
@@ -414,7 +441,8 @@ def process_raw(
         detector.shape,
         min_radius,
         max_radius,
-        float(np.clip(strength, 0.0, 1.0)),
+        relative_brightness_floor,
+        float(np.clip(strength, 0.0, 30.0)) / 100.0,
         report,
     )
     report(92, "正在写入 16 位 TIFF…")
@@ -424,15 +452,21 @@ def process_raw(
     rgb16 = linear_rgb.astype(np.uint16)
     del linear_rgb
     description = {
-        "software": "星点柔焦 1.1",
+        "software": "星点柔焦 1.2",
         "camera": info.camera,
         "lens": info.lens,
         "focal_length_mm": info.focal_length,
         "aperture": info.aperture,
         "detected_stars": len(stars),
         "point_source_candidates": candidate_count,
+        "relative_brightness_eligible_candidates": eligible_count,
+        "relative_brightness_floor_flux_ratio": relative_brightness_floor,
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
-        "soft_focus": "Gaussian PSF layer, Lighten blend, sigma=radius/3, original bright core retained",
+        "relative_brightness_note": "relative SEP aperture-flux ratio; not catalog apparent magnitude",
+        "relative_magnitude_difference_definition": "delta_mag=-2.5*log10(flux_ratio), relative to the brightest detected candidate",
+        "soft_focus": "Gaussian PSF layer with strength as alpha opacity (Lighten blend), sigma=radius/3, radius linearly mapped from relative magnitude difference, original bright core retained",
+        "soft_focus_strength_percent": round(float(np.clip(strength, 0.0, 30.0)), 1),
+        "soft_focus_color": "local demosaiced linear RGB peak per channel; hue retained",
         "star_photometry_and_halo_parameters": star_measurements,
         "encoding": "sRGB transfer, 16-bit RGB",
     }
@@ -446,7 +480,7 @@ def process_raw(
             planarconfig="contig",
             metadata={"axes": "YXS", **description},
             iccprofile=srgb_profile,
-            software="StarSoftFocus 1.1",
+            software="StarSoftFocus 1.2",
         )
         os.replace(temporary, output_path)
     finally:
@@ -457,6 +491,8 @@ def process_raw(
         output_path=str(output_path),
         star_count=len(stars),
         candidate_count=candidate_count,
+        eligible_count=eligible_count,
+        relative_brightness_floor=relative_brightness_floor,
         width=int(rgb16.shape[1]),
         height=int(rgb16.shape[0]),
         camera=info.camera,

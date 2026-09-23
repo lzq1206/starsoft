@@ -86,6 +86,8 @@ def _run_job(job_id: str, raw_path: Path, output_path: Path, params: dict[str, f
             message="柔焦完成",
             stars=result.star_count,
             candidates=result.candidate_count,
+            eligible=result.eligible_count,
+            relativeBrightnessFloor=result.relative_brightness_floor,
             width=result.width,
             height=result.height,
             outputName=Path(result.output_path).name,
@@ -104,7 +106,7 @@ def _make_handler(token: str):
     base = f"/{token}"
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "StarSoftFocus/1.0"
+        server_version = "StarSoftFocus/1.2"
         sys_version = ""
 
         def log_message(self, _format: str, *_args: object) -> None:
@@ -218,7 +220,8 @@ def _make_handler(token: str):
             try:
                 params = {
                     "sensitivity": float(query.get("sensitivity", ["4.8"])[0]),
-                    "strength": float(query.get("strength", ["0.58"])[0]),
+                    "strength": float(query.get("strength", ["10"])[0]),
+                    "relative_brightness_floor": float(query.get("relative_brightness_floor", ["0.063"])[0]),
                     "min_radius": float(query.get("min_radius", ["3"])[0]),
                     "max_radius": float(query.get("max_radius", ["34"])[0]),
                 }
@@ -226,7 +229,8 @@ def _make_handler(token: str):
                 self._json(400, {"error": "柔焦参数无效"})
                 return
             params["sensitivity"] = min(max(params["sensitivity"], 2.0), 10.0)
-            params["strength"] = min(max(params["strength"], 0.0), 1.0)
+            params["strength"] = min(max(params["strength"], 0.0), 30.0)
+            params["relative_brightness_floor"] = min(max(params["relative_brightness_floor"], 0.0), 1.0)
             params["min_radius"] = min(max(params["min_radius"], 2.0), 24.0)
             params["max_radius"] = min(max(params["max_radius"], 8.0), 80.0)
             if params["max_radius"] < params["min_radius"]:

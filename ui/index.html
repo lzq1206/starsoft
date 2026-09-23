@@ -44,13 +44,15 @@
             <h3 class="card-title">星点识别与光晕</h3>
             <div class="group"><label for="sensitivity">星点识别灵敏度</label><span id="sensitivityValue" class="value"></span></div>
             <input id="sensitivity" class="range" type="range" min="2" max="10" step="0.2" value="4.8">
-            <div class="group"><label for="strength">柔焦强度</label><span id="strengthValue" class="value"></span></div>
-            <input id="strength" class="range" type="range" min="0" max="1" step="0.01" value="0.58">
+            <div class="group"><label for="strength">柔焦强度（不透明度）</label><span id="strengthValue" class="value"></span></div>
+            <input id="strength" class="range" type="range" min="0" max="30" step="1" value="10">
+            <div class="group"><label for="relativeBrightness">相对亮度下限</label><span id="relativeBrightnessValue" class="value"></span></div>
+            <input id="relativeBrightness" class="range" type="range" min="0.1" max="100" step="0.1" value="6.3">
             <div class="group"><label for="minRadius">最小柔焦半径</label><span id="minValue" class="value"></span></div>
             <input id="minRadius" class="range" type="range" min="2" max="24" step="1" value="3">
             <div class="group"><label for="maxRadius">最大柔焦半径</label><span id="maxValue" class="value"></span></div>
             <input id="maxRadius" class="range" type="range" min="8" max="80" step="1" value="34">
-            <p class="hint">SEP 根据局部背景、噪声和点源形态测光；默认对最亮的 50 颗逐星生成 Gaussian 光晕，亮星半径更大。</p>
+            <p class="hint">相对亮度按 SEP 孔径通量筛选：默认门限为图中最亮候选的 6.3%。这是画面内的相对通量，不是星表星等。所有达到门限的候选都会逐星柔焦，光晕保留每颗星的 RGB 颜色。</p>
           </div>
         </div>
         <div class="export-wrap">
@@ -85,7 +87,8 @@
     const formatBytes=n=>n<1024*1024?`${(n/1024).toFixed(0)} KB`:`${(n/1024/1024).toFixed(1)} MB`;
     function slider(id,valueId,format){const el=$(id),out=$(valueId);const draw=()=>out.textContent=format(Number(el.value));el.addEventListener("input",draw);draw();}
     slider("sensitivity","sensitivityValue",v=>`${v.toFixed(1)} σ`);
-    slider("strength","strengthValue",v=>`${Math.round(v*100)}%`);
+    slider("strength","strengthValue",v=>`${Math.round(v)}%`);
+    slider("relativeBrightness","relativeBrightnessValue",v=>`${v.toFixed(1)}%（相对最亮候选）`);
     slider("minRadius","minValue",v=>`${v.toFixed(0)} px`);
     slider("maxRadius","maxValue",v=>`${v.toFixed(0)} px`);
     function chooseFile(file){if(!file)return;selectedFile=file;$("fileMeta").classList.add("show");$("fileName").textContent=file.name;$("fileSize").textContent=formatBytes(file.size);$("lensMeta").textContent="RAW 镜头信息将在解码时读取";start.disabled=busy;$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="文件已就绪，可以开始处理";setStatus("RAW 已就绪 · 可调整星点识别与柔焦范围",0);}
@@ -95,13 +98,13 @@
     drop.addEventListener("drop",e=>chooseFile(e.dataTransfer.files[0]));
     async function pollJob(id){try{const response=await fetch(`${BASE}/api/jobs/${encodeURIComponent(id)}`);const job=await response.json();if(!response.ok)throw new Error(job.error||"任务状态读取失败");if(job.metadata){const m=job.metadata;const bits=[m.lens||"未记录镜头"];if(m.focalLength)bits.push(`${m.focalLength} mm`);if(m.aperture)bits.push(`f/${m.aperture}`);$("lensMeta").textContent=`${m.width.toLocaleString()} × ${m.height.toLocaleString()} px · ${bits.join(" · ")}`;}
       setStatus(job.message||"正在处理…",job.percent||0);
-      if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent=`${job.stars.toLocaleString()} 颗亮星柔焦 · ${job.candidates.toLocaleString()} 个 SEP 点源候选 · ${job.width.toLocaleString()} × ${job.height.toLocaleString()} · ${job.outputName}`;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
+      if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent=`${job.stars.toLocaleString()} 颗星点柔焦 · ${job.eligible.toLocaleString()} 个通过相对亮度门限 · ${job.candidates.toLocaleString()} 个 SEP 点源候选 · ${job.width.toLocaleString()} × ${job.height.toLocaleString()} · ${job.outputName}`;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
         $("result").classList.add("show");busy=false;start.disabled=false;start.textContent="✦  更改参数后再次处理";setStatus("柔焦完成",100);return;}
       if(job.state==="error")throw new Error(job.message||"处理失败");
       setTimeout(()=>pollJob(id),650);
     }catch(error){busy=false;start.disabled=!selectedFile;start.textContent="✦  开始星点柔焦";setStatus(error.message,0);$("status").classList.add("error");}}
     start.addEventListener("click",async()=>{if(!selectedFile||busy)return;busy=true;start.disabled=true;start.textContent="正在处理…";$("status").classList.remove("error");$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="正在识别 RAW 星点";$("previewLabel").textContent="本机处理进行中";setStatus("正在上传 RAW 到本机处理进程…",2);
-      const params=new URLSearchParams({sensitivity:$("sensitivity").value,strength:$("strength").value,min_radius:$("minRadius").value,max_radius:$("maxRadius").value});
+      const params=new URLSearchParams({sensitivity:$("sensitivity").value,strength:$("strength").value,relative_brightness_floor:(Number($("relativeBrightness").value)/100).toFixed(4),min_radius:$("minRadius").value,max_radius:$("maxRadius").value});
       try{const body=await new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("POST",`${BASE}/api/jobs?${params}`);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.setRequestHeader("X-File-Name",encodeURIComponent(selectedFile.name));xhr.upload.onprogress=e=>{if(e.lengthComputable)setStatus(`正在上传 RAW… ${formatBytes(e.loaded)} / ${formatBytes(e.total)}`,Math.round(2+8*e.loaded/e.total));};xhr.onload=()=>{let data={};try{data=JSON.parse(xhr.responseText);}catch(_){}if(xhr.status<200||xhr.status>=300)reject(new Error(data.error||"无法开始处理"));else resolve(data);};xhr.onerror=()=>reject(new Error("与本机处理进程的连接中断"));xhr.send(selectedFile);});currentJob=body.id;setStatus("文件已接收，正在识别星点…",10);pollJob(currentJob);}catch(error){busy=false;start.disabled=false;start.textContent="✦  开始星点柔焦";$("status").classList.add("error");setStatus(error.message,0);}});
     $("exit").addEventListener("click",async()=>{if(busy&&!confirm("处理正在进行。退出会中断本次处理，确定退出吗？"))return;$("exit").textContent="正在退出…";try{await fetch(`${BASE}/api/shutdown`,{method:"POST"});}catch(_){}document.body.innerHTML='<main style="font:14px Microsoft YaHei UI, sans-serif;color:#eee;background:#0e1017;height:100vh;display:grid;place-items:center;text-align:center"><div><div style="font-size:34px;color:#c7a9ff">✦</div><b>星点柔焦已关闭</b><p style="color:#9da4b8">可以关闭此浏览器页面。</p></div></main>';});
   </script>
