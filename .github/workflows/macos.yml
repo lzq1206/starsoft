@@ -67,11 +67,33 @@ jobs:
       - name: Build executable and zip
         shell: pwsh
         run: .\build.ps1
+      - name: Read packaged version
+        id: packaged-version
+        shell: pwsh
+        run: |
+          $source = Get-Content -LiteralPath version.py -Raw
+          $match = [regex]::Match($source, 'APP_VERSION\s*=\s*"(?<version>[^"]+)"')
+          if (-not $match.Success) { throw "version.py 中未找到有效版本号。" }
+          $version = $match.Groups['version'].Value
+          $zipPath = Join-Path 'releases' "星点柔焦-v$version-win-x64.zip"
+          if (-not (Test-Path -LiteralPath $zipPath)) { throw "没有生成预期 ZIP：$zipPath" }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $zipPath).Path)
+          try {
+            $entry = $archive.GetEntry('VERSION.txt')
+            if (-not $entry) { throw 'ZIP 中缺少 VERSION.txt。' }
+            $reader = [System.IO.StreamReader]::new($entry.Open())
+            try { $packagedVersion = $reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
+          } finally {
+            $archive.Dispose()
+          }
+          if ($packagedVersion -ne $version) { throw "ZIP 中的版本 $packagedVersion 与构建版本 $version 不一致。" }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "version=$version" -Encoding utf8
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
           name: windows-release
-          path: releases/星点柔焦-v*-win-x64.zip
+          path: releases/星点柔焦-v${{ steps.packaged-version.outputs.version }}-win-x64.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -107,7 +129,7 @@ jobs:
             test -n "$source_zip"
             cp "$source_zip" "release-assets/starsoft-v${version}-macos-${arch}.zip"
           done
-          windows_zip="$(find windows-source -maxdepth 1 -type f -name "*-win-x64.zip" -print -quit)"
+          windows_zip="$(find windows-source -maxdepth 2 -type f -name "星点柔焦-v${version}-win-x64.zip" -print -quit)"
           test -n "$windows_zip"
           cp "$windows_zip" "release-assets/starsoft-v${version}-win-x64.zip"
           (
