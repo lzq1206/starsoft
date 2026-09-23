@@ -50,7 +50,7 @@
             <input id="minRadius" class="range" type="range" min="2" max="24" step="1" value="3">
             <div class="group"><label for="maxRadius">最大柔焦半径</label><span id="maxValue" class="value"></span></div>
             <input id="maxRadius" class="range" type="range" min="8" max="80" step="1" value="34">
-            <p class="hint">星点越亮，柔焦半径越接近最大值。</p>
+            <p class="hint">SEP 根据局部背景、噪声和点源形态测光；默认对最亮的 50 颗逐星生成 Gaussian 光晕，亮星半径更大。</p>
           </div>
         </div>
         <div class="export-wrap">
@@ -95,7 +95,7 @@
     drop.addEventListener("drop",e=>chooseFile(e.dataTransfer.files[0]));
     async function pollJob(id){try{const response=await fetch(`${BASE}/api/jobs/${encodeURIComponent(id)}`);const job=await response.json();if(!response.ok)throw new Error(job.error||"任务状态读取失败");if(job.metadata){const m=job.metadata;const bits=[m.lens||"未记录镜头"];if(m.focalLength)bits.push(`${m.focalLength} mm`);if(m.aperture)bits.push(`f/${m.aperture}`);$("lensMeta").textContent=`${m.width.toLocaleString()} × ${m.height.toLocaleString()} px · ${bits.join(" · ")}`;}
       setStatus(job.message||"正在处理…",job.percent||0);
-      if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent=`${job.stars.toLocaleString()} 个星点 · ${job.width.toLocaleString()} × ${job.height.toLocaleString()} · ${job.outputName}`;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
+      if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent=`${job.stars.toLocaleString()} 颗亮星柔焦 · ${job.candidates.toLocaleString()} 个 SEP 点源候选 · ${job.width.toLocaleString()} × ${job.height.toLocaleString()} · ${job.outputName}`;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
         $("result").classList.add("show");busy=false;start.disabled=false;start.textContent="✦  更改参数后再次处理";setStatus("柔焦完成",100);return;}
       if(job.state==="error")throw new Error(job.message||"处理失败");
       setTimeout(()=>pollJob(id),650);

@@ -12,7 +12,7 @@ if ($LASTEXITCODE -ne 0) { throw "依赖安装失败。" }
 
 Push-Location $project
 try {
-    & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --collect-all rawpy --collect-all tifffile --add-data "ui\index.html;ui" app.py
+    & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --collect-all rawpy --collect-all sep --collect-all tifffile --add-data "ui\index.html;ui" app.py
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败。" }
 } finally {
     Pop-Location

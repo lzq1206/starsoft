@@ -85,6 +85,7 @@ def _run_job(job_id: str, raw_path: Path, output_path: Path, params: dict[str, f
             percent=100,
             message="柔焦完成",
             stars=result.star_count,
+            candidates=result.candidate_count,
             width=result.width,
             height=result.height,
             outputName=Path(result.output_path).name,

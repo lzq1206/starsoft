@@ -10,6 +10,7 @@ from typing import Callable
 
 import numpy as np
 import rawpy
+import sep
 import tifffile
 from PIL import Image, ImageCms
 
@@ -37,12 +38,14 @@ class Star:
     y: float
     flux: float
     peak: float
+    fwhm: float
 
 
 @dataclass(frozen=True)
 class ProcessResult:
     output_path: str
     star_count: int
+    candidate_count: int
     width: int
     height: int
     camera: str
@@ -65,9 +68,13 @@ def _raw_info(raw: rawpy.RawPy, preview: Image.Image | None = None) -> RawInfo:
     ) or "未记录镜头"
     focal = float(other.focal_length or 0)
     aperture = float(other.aperture or 0)
+    width = int(sizes.width)
+    height = int(sizes.height)
+    if int(sizes.flip) in (5, 6):
+        width, height = height, width
     return RawInfo(
-        width=int(sizes.width),
-        height=int(sizes.height),
+        width=width,
+        height=height,
         camera=camera,
         lens=lens_name,
         focal_length=focal if math.isfinite(focal) and focal > 0 else None,
@@ -94,16 +101,16 @@ def read_raw_info(path: str | Path) -> RawInfo:
 
 
 def _detector_image(raw: rawpy.RawPy) -> tuple[np.ndarray, int]:
-    """Build a small linear luminance proxy from the visible sensor area."""
+    """Build a binned, linear luminance proxy from the visible sensor area."""
     sensor = raw.raw_image_visible
     height, width = sensor.shape[:2]
 
     focal = float(raw.other.focal_length or 0)
     if not focal:
         focal = 70.0
-    # Longer focal lengths resolve a star to more sensor pixels; retain more
-    # detector detail for them. Short lenses use a smaller, faster search image.
-    target_edge = int(np.clip(2200 + focal * 5.0, 2300, 4200))
+    # Longer focal lengths give a larger stellar profile on the same sensor.
+    # Retain more detector pixels for them; the Bayer-safe minimum bin is 2x2.
+    target_edge = int(np.clip(4200 + focal * 55.0, 4600, 9000))
     factor = max(2, int(math.ceil(max(height, width) / target_edge)))
     if factor % 2:
         factor += 1  # keep Bayer color samples grouped together
@@ -122,141 +129,133 @@ def _detector_image(raw: rawpy.RawPy) -> tuple[np.ndarray, int]:
     white = float(raw.white_level)
     dynamic_range = max(white - black, 1.0)
     image = np.clip((binned - black) / dynamic_range, 0.0, 1.0).astype(np.float32, copy=False)
+    # raw_image_visible is in sensor coordinates; LibRaw rotates the developed
+    # RGB output from this same orientation tag, so align SEP coordinates first.
+    flip = int(raw.sizes.flip)
+    if flip == 3:
+        image = np.rot90(image, 2)
+    elif flip == 5:
+        image = np.rot90(image, 1)
+    elif flip == 6:
+        image = np.rot90(image, 3)
     return image, factor
-
-
-def _background_and_noise(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    height, width = image.shape
-    tile_size = 112
-    rows = math.ceil(height / tile_size)
-    cols = math.ceil(width / tile_size)
-    bg_tiles = np.empty((rows, cols), dtype=np.float32)
-    noise_tiles = np.empty((rows, cols), dtype=np.float32)
-
-    for ty in range(rows):
-        y0 = ty * tile_size
-        y1 = min(height, y0 + tile_size)
-        for tx in range(cols):
-            x0 = tx * tile_size
-            x1 = min(width, x0 + tile_size)
-            patch = image[y0:y1, x0:x1]
-            median = float(np.median(patch))
-            mad = float(np.median(np.abs(patch - median))) * 1.4826
-            bg_tiles[ty, tx] = median
-            noise_tiles[ty, tx] = mad
-
-    # Nearest-tile interpolation keeps the full detector image allocation small.
-    bg = np.repeat(np.repeat(bg_tiles, tile_size, axis=0), tile_size, axis=1)[:height, :width]
-    noise = np.repeat(np.repeat(noise_tiles, tile_size, axis=0), tile_size, axis=1)[:height, :width]
-    global_mad = float(np.median(np.abs(image - np.median(image)))) * 1.4826
-    noise_floor = max(global_mad * 0.25, 1.0 / 65535.0)
-    np.maximum(noise, noise_floor, out=noise)
-    return bg, noise
-
-
-def _star_shape_ok(signal: np.ndarray, x: int, y: int, threshold: float) -> bool:
-    height, width = signal.shape
-    if x < 3 or y < 3 or x >= width - 3 or y >= height - 3:
-        return False
-    patch = signal[y - 3 : y + 4, x - 3 : x + 4]
-    peak = float(signal[y, x])
-    # A hot/dead sensor pixel has no surrounding point-spread profile.
-    if np.count_nonzero(patch >= max(peak * 0.045, threshold * 0.18)) < 2:
-        return False
-    weights = np.maximum(patch - max(threshold * 0.08, 0.0), 0.0)
-    total = float(weights.sum())
-    if total <= 0:
-        return False
-    yy, xx = np.mgrid[-3:4, -3:4]
-    cx = float((weights * xx).sum() / total)
-    cy = float((weights * yy).sum() / total)
-    if abs(cx) > 1.15 or abs(cy) > 1.15:
-        return False
-    xx = xx - cx
-    yy = yy - cy
-    mxx = float((weights * xx * xx).sum() / total)
-    myy = float((weights * yy * yy).sum() / total)
-    mxy = float((weights * xx * yy).sum() / total)
-    discriminant = math.sqrt(max((mxx - myy) ** 2 + 4.0 * mxy * mxy, 0.0))
-    major = max((mxx + myy + discriminant) * 0.5, 1e-8)
-    minor = max((mxx + myy - discriminant) * 0.5, 0.0)
-    roundness = math.sqrt(minor / major)
-    return roundness >= 0.19 and major < 18.0
 
 
 def detect_stars(
     detector: np.ndarray,
-    focal_length: float | None,
     sensitivity: float,
-    max_stars: int = 12000,
-) -> list[Star]:
-    """Find compact, round local maxima with an adaptive local-noise threshold."""
-    background, noise = _background_and_noise(detector)
-    signal = detector - background
-    threshold_map = noise * float(sensitivity)
-    center = signal[1:-1, 1:-1]
-    candidates = center >= threshold_map[1:-1, 1:-1]
-    neighbors = (
-        signal[:-2, :-2], signal[:-2, 1:-1], signal[:-2, 2:],
-        signal[1:-1, :-2], signal[1:-1, 2:],
-        signal[2:, :-2], signal[2:, 1:-1], signal[2:, 2:],
+    max_stars: int = 50,
+) -> tuple[list[Star], int]:
+    """Use SEP extraction and aperture photometry, returning the brightest point sources."""
+    data = np.ascontiguousarray(detector, dtype=np.float32)
+    background = sep.Background(data, bw=64, bh=64, fw=3, fh=3)
+    signal = np.ascontiguousarray(data - background.back(), dtype=np.float32)
+    noise = np.ascontiguousarray(background.rms(), dtype=np.float32)
+    first_pass = sep.extract(
+        signal,
+        float(sensitivity),
+        err=noise,
+        minarea=4,
+        deblend_nthresh=32,
+        deblend_cont=0.005,
+        clean=True,
     )
-    for neighbor in neighbors:
-        candidates &= center >= neighbor
-    # Break plateaus deterministically and avoid duplicate equal-valued maxima.
-    strict = np.zeros_like(candidates)
-    for neighbor in neighbors:
-        strict |= center > neighbor
-    candidates &= strict
+    if len(first_pass) == 0:
+        return [], 0
 
-    ys, xs = np.nonzero(candidates)
-    if len(xs) == 0:
-        return []
-    ys = ys + 1
-    xs = xs + 1
-    peaks = signal[ys, xs]
-    order = np.argsort(peaks)[::-1]
-    if len(order) > 60000:
-        order = order[:60000]
+    first_major = np.maximum(first_pass["a"], first_pass["b"])
+    first_minor = np.minimum(first_pass["a"], first_pass["b"])
+    first_size = np.sqrt(np.maximum(first_pass["a"] * first_pass["b"], 0.0))
+    first_roundness = first_minor / np.maximum(first_major, 1e-8)
+    first_good = (
+        (first_pass["flag"] == 0)
+        & (first_roundness >= 0.5)
+        & (first_size >= 0.45)
+        & (first_size <= 6.0)
+        & (first_pass["flux"] > 0)
+    )
+    if np.any(first_good):
+        # Estimate the image's stellar width from its brighter compact sources,
+        # then use SEP's documented PSF-shaped matched filter for a second pass.
+        calibration_indices = np.flatnonzero(first_good)
+        brightest = calibration_indices[
+            np.argsort(first_pass["flux"][calibration_indices])[-200:]
+        ]
+        psf_sigma = float(np.median(first_size[brightest]))
+    else:
+        psf_sigma = 1.0
+    kernel_radius = int(np.clip(math.ceil(2.5 * psf_sigma), 1, 6))
+    axis = np.arange(-kernel_radius, kernel_radius + 1, dtype=np.float32)
+    kernel = np.exp(
+        -0.5 * (axis[:, None] ** 2 + axis[None, :] ** 2) / max(psf_sigma**2, 0.25)
+    ).astype(np.float32)
+    kernel /= float(kernel.sum())
+    objects = sep.extract(
+        signal,
+        float(sensitivity),
+        err=noise,
+        minarea=4,
+        filter_kernel=kernel,
+        filter_type="matched",
+        deblend_nthresh=32,
+        deblend_cont=0.005,
+        clean=True,
+        segmentation_map=False,
+    )
+    if len(objects) == 0:
+        return [], 0
 
-    # The focal-length prior narrows duplicate suppression for wide lenses and
-    # allows slightly wider separation for long lenses. Missing EXIF uses 70 mm.
-    focal = focal_length or 70.0
-    min_separation = float(np.clip(1.45 + focal / 700.0, 1.5, 2.5))
-    cell_size = min_separation
-    buckets: dict[tuple[int, int], list[tuple[float, float]]] = {}
-    stars: list[Star] = []
+    major = np.maximum(objects["a"], objects["b"])
+    minor = np.minimum(objects["a"], objects["b"])
+    moment_size = np.sqrt(np.maximum(objects["a"] * objects["b"], 0.0))
+    roundness = minor / np.maximum(major, 1e-8)
+    bad_flags = (objects["flag"] & (sep.OBJ_TRUNC | sep.OBJ_SINGU)) != 0
+    point_source = (
+        np.isfinite(objects["x"])
+        & np.isfinite(objects["y"])
+        & np.isfinite(objects["flux"])
+        & np.isfinite(moment_size)
+        & (objects["flux"] > 0)
+        & (minor >= 0.45)
+        & (major <= 12.0)
+        & (roundness >= 0.35)
+        & ~bad_flags
+    )
+    indices = np.flatnonzero(point_source)
+    if len(indices) == 0:
+        return [], 0
 
-    for idx in order:
-        x = int(xs[idx])
-        y = int(ys[idx])
-        peak = float(peaks[idx])
-        threshold = float(threshold_map[y, x])
-        if not _star_shape_ok(signal, x, y, threshold):
-            continue
-        cell = (int(x / cell_size), int(y / cell_size))
-        duplicate = False
-        for by in range(cell[1] - 2, cell[1] + 3):
-            for bx in range(cell[0] - 2, cell[0] + 3):
-                for ox, oy in buckets.get((bx, by), ()):
-                    if (ox - x) ** 2 + (oy - y) ** 2 < min_separation**2:
-                        duplicate = True
-                        break
-                if duplicate:
-                    break
-            if duplicate:
-                break
-        if duplicate:
-            continue
-        patch = signal[y - 2 : y + 3, x - 2 : x + 3]
-        flux = float(np.maximum(patch, 0).sum())
-        if flux <= 0:
-            continue
-        buckets.setdefault(cell, []).append((x, y))
-        stars.append(Star(float(x), float(y), flux, peak))
-        if len(stars) >= max_stars:
-            break
-    return stars
+    # SEP's isophotal flux is useful for extraction. Circular aperture flux is
+    # measured separately so the brightness ordering includes more of each PSF.
+    fwhm = 2.354820045 * moment_size[indices]
+    aperture_radius = np.clip(1.25 * fwhm, 2.5, 12.0)
+    flux, _flux_error, aperture_flags = sep.sum_circle(
+        signal,
+        objects["x"][indices],
+        objects["y"][indices],
+        aperture_radius,
+        err=noise,
+        subpix=5,
+    )
+    good = np.isfinite(flux) & (flux > 0) & ((aperture_flags & sep.APER_TRUNC) == 0)
+    indices = indices[good]
+    flux = flux[good]
+    if len(indices) == 0:
+        return [], 0
+
+    candidate_count = int(len(indices))
+    order = np.argsort(flux)[::-1][: max(1, int(max_stars))]
+    stars = [
+        Star(
+            float(objects["x"][indices[i]]),
+            float(objects["y"][indices[i]]),
+            float(flux[i]),
+            float(objects["peak"][indices[i]]),
+            float(2.354820045 * moment_size[indices[i]]),
+        )
+        for i in order
+    ]
+    return stars, candidate_count
 
 
 def _soften_stars(
@@ -267,9 +266,9 @@ def _soften_stars(
     max_radius: float,
     strength: float,
     progress: Progress | None = None,
-) -> None:
+) -> list[dict[str, float]]:
     if not stars or strength <= 0:
-        return
+        return []
     out_h, out_w = linear_rgb.shape[:2]
     det_h, det_w = detector_shape
     xs = np.asarray([star.flux for star in stars], dtype=np.float64)
@@ -280,60 +279,64 @@ def _soften_stars(
     else:
         levels = np.clip((log_flux - low) / (high - low), 0.0, 1.0).astype(np.float32)
 
-    order = np.argsort(xs)  # process dim stars first so bright-star glow remains visible
+    order = np.argsort(xs)[::-1]
+    records: list[dict[str, float]] = []
+    scale_x = out_w / det_w
+    scale_y = out_h / det_h
+    prepared: list[tuple[Star, float, float, np.ndarray]] = []
+    for star in stars:
+        cx = (star.x + 0.5) * scale_x - 0.5
+        cy = (star.y + 0.5) * scale_y - 0.5
+        center_x = int(round(cx))
+        center_y = int(round(cy))
+        core = linear_rgb[
+            max(0, center_y - 2) : min(out_h, center_y + 3),
+            max(0, center_x - 2) : min(out_w, center_x + 3),
+            :,
+        ]
+        color_peak = np.quantile(core.reshape(-1, 3), 0.9, axis=0)
+        prepared.append((star, cx, cy, color_peak))
+
     for index, position in enumerate(order):
-        star = stars[int(position)]
+        star, cx, cy, color_peak = prepared[int(position)]
         brightness = float(levels[int(position)]) ** 0.85
         radius = float(min_radius + brightness * (max_radius - min_radius))
         sigma = max(radius / 3.0, 0.65)
-        cx = int(round((star.x + 0.5) * out_w / det_w))
-        cy = int(round((star.y + 0.5) * out_h / det_h))
-        extent = max(2, int(math.ceil(radius)))
-        x0 = max(0, cx - extent)
-        x1 = min(out_w, cx + extent + 1)
-        y0 = max(0, cy - extent)
-        y1 = min(out_h, cy + extent + 1)
-        patch = linear_rgb[y0:y1, x0:x1]
-        if patch.size == 0:
+        extent = max(2, int(math.ceil(3.0 * sigma)))
+        center_x = int(round(cx))
+        center_y = int(round(cy))
+        x0 = max(0, center_x - extent)
+        x1 = min(out_w, center_x + extent + 1)
+        y0 = max(0, center_y - extent)
+        y1 = min(out_h, center_y + extent + 1)
+        if x1 <= x0 or y1 <= y0:
             continue
-        source = patch.copy()
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        mask = np.exp(-0.5 * ((xx - cx) ** 2 + (yy - cy) ** 2) / max((radius / 2.4) ** 2, 0.2))
-        mask = (mask * strength).astype(np.float32)[..., None]
-        blurred = _blur_float_rgb(source, sigma)
-        patch[...] = source + (blurred - source) * mask
+
+        # Keep the original star image as the sharp base layer. The halo is a
+        # per-source Gaussian PSF kernel whose center peaks and whose wings
+        # fall smoothly toward zero; its amplitude follows measured source flux.
+        peak = float(np.max(color_peak))
+        if peak > 0:
+            color = color_peak / peak
+            yy, xx = np.ogrid[y0:y1, x0:x1]
+            distance2 = (xx - cx) ** 2 + (yy - cy) ** 2
+            gaussian = np.exp(-0.5 * distance2 / (sigma * sigma)).astype(np.float32)
+            halo_scale = float(np.clip(0.06 + 0.18 * brightness, 0.0, 0.24)) * strength
+            linear_rgb[y0:y1, x0:x1, :] += (
+                gaussian[..., None] * (peak * halo_scale * color.astype(np.float32))[None, None, :]
+            )
+            records.append(
+                {
+                    "x_px": round(float(cx), 2),
+                    "y_px": round(float(cy), 2),
+                    "aperture_flux": round(float(star.flux), 7),
+                    "fwhm_px": round(float(star.fwhm * (scale_x + scale_y) * 0.5), 3),
+                    "halo_radius_px": round(radius, 2),
+                }
+            )
         if progress and (index == len(order) - 1 or index % max(1, len(order) // 20) == 0):
-            progress(65 + int(25 * (index + 1) / len(order)), f"正在柔化星点… {index + 1}/{len(order)}")
-
-
-def _box_blur_float(image: np.ndarray, radius: int, axis: int) -> np.ndarray:
-    """Fast edge-extended box blur for float RGB arrays using cumulative sums."""
-    if radius <= 0:
-        return image
-    pad = [(0, 0)] * image.ndim
-    pad[axis] = (radius, radius)
-    padded = np.pad(image, pad, mode="edge")
-    cumulative = np.cumsum(padded, axis=axis, dtype=np.float32)
-    zero_shape = list(cumulative.shape)
-    zero_shape[axis] = 1
-    cumulative = np.concatenate((np.zeros(zero_shape, dtype=np.float32), cumulative), axis=axis)
-    width = radius * 2 + 1
-    start = [slice(None)] * image.ndim
-    end = [slice(None)] * image.ndim
-    start[axis] = slice(0, image.shape[axis])
-    end[axis] = slice(width, width + image.shape[axis])
-    return (cumulative[tuple(end)] - cumulative[tuple(start)]) / width
-
-
-def _blur_float_rgb(image: np.ndarray, sigma: float) -> np.ndarray:
-    """Approximate a Gaussian with three separable box passes in float32."""
-    radius = max(1, int(round(sigma)))
-    blurred = image
-    for _ in range(3):
-        blurred = _box_blur_float(blurred, radius, axis=1)
-    for _ in range(3):
-        blurred = _box_blur_float(blurred, radius, axis=0)
-    return blurred
+            progress(65 + int(25 * (index + 1) / len(order)), f"正在生成逐星 Gaussian 光晕… {index + 1}/{len(order)}")
+    return records
 
 
 def _linear_to_srgb_inplace(linear: np.ndarray) -> None:
@@ -355,7 +358,7 @@ def process_raw(
     strength: float = 0.55,
     min_radius: float = 3.0,
     max_radius: float = 32.0,
-    max_stars: int = 12000,
+    max_stars: int = 50,
     progress: Progress | None = None,
     metadata_callback: MetadataCallback | None = None,
 ) -> ProcessResult:
@@ -379,8 +382,8 @@ def process_raw(
             metadata_callback(info)
         detector, _factor = _detector_image(raw)
         report(12, "正在识别星点与测量亮度…")
-        stars = detect_stars(detector, info.focal_length, sensitivity, max_stars)
-        report(35, f"识别到 {len(stars):,} 个候选星点，正在解码 RAW…")
+        stars, candidate_count = detect_stars(detector, sensitivity, max_stars)
+        report(35, f"SEP 找到 {candidate_count:,} 个点源候选，选取最亮的 {len(stars):,} 颗，正在解码 RAW…")
         rgb = raw.postprocess(
             gamma=(1, 1),
             no_auto_bright=True,
@@ -396,7 +399,7 @@ def process_raw(
     np.divide(rgb[..., :3], 65535.0, out=linear_rgb, casting="unsafe")
     del rgb
     report(63, "RAW 解码完成，开始按星点亮度柔化…")
-    _soften_stars(
+    star_measurements = _soften_stars(
         linear_rgb,
         stars,
         detector.shape,
@@ -412,12 +415,16 @@ def process_raw(
     rgb16 = linear_rgb.astype(np.uint16)
     del linear_rgb
     description = {
-        "software": "星点柔焦 1.0",
+        "software": "星点柔焦 1.1",
         "camera": info.camera,
         "lens": info.lens,
         "focal_length_mm": info.focal_length,
         "aperture": info.aperture,
         "detected_stars": len(stars),
+        "point_source_candidates": candidate_count,
+        "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
+        "soft_focus": "additive Gaussian PSF halo, sigma=radius/3, original sharp image retained",
+        "star_photometry_and_halo_parameters": star_measurements,
         "encoding": "sRGB transfer, 16-bit RGB",
     }
     srgb_profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
@@ -430,7 +437,7 @@ def process_raw(
             planarconfig="contig",
             metadata={"axes": "YXS", **description},
             iccprofile=srgb_profile,
-            software="StarSoftFocus 1.0",
+            software="StarSoftFocus 1.1",
         )
         os.replace(temporary, output_path)
     finally:
@@ -440,6 +447,7 @@ def process_raw(
     return ProcessResult(
         output_path=str(output_path),
         star_count=len(stars),
+        candidate_count=candidate_count,
         width=int(rgb16.shape[1]),
         height=int(rgb16.shape[0]),
         camera=info.camera,
