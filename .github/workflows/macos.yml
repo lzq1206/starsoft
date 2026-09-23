@@ -65,7 +65,7 @@ jobs:
         with:
           pattern: macos-*
           merge-multiple: true
-          path: release-assets
+          path: release-source
       - name: Add Windows build and publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -76,7 +76,17 @@ jobs:
           tag="v${version}"
           windows_zip="releases/星点柔焦-v${version}-win-x64.zip"
           test -f "$windows_zip"
-          cp "$windows_zip" release-assets/
+          mkdir -p release-assets
+          for arch in arm64 x64; do
+            source_zip="$(find release-source -maxdepth 1 -type f -name "*-macos-${arch}.zip" -print -quit)"
+            test -n "$source_zip"
+            cp "$source_zip" "release-assets/starsoft-v${version}-macos-${arch}.zip"
+          done
+          cp "$windows_zip" "release-assets/starsoft-v${version}-win-x64.zip"
+          (
+            cd release-assets
+            for asset in *.zip; do shasum -a 256 "$asset" > "$asset.sha256"; done
+          )
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" release-assets/* --clobber
           else
