@@ -32,7 +32,7 @@
             <h3 class="card-title">选择图像文件</h3>
             <p class="subtle">相机 RAW · TIFF · JPG / JPEG</p>
             <div id="drop" class="drop">
-              <div class="cloud">⇧</div><strong>拖入 RAW、TIFF 或 JPG</strong><small>文件只会在这台电脑上处理</small>
+                <div class="cloud">⇧</div><strong>拖入 RAW、TIFF 或 JPG</strong><small>图像解算与 Gaia 派生亮星匹配均在本机完成</small>
               <label for="file" class="file-button">浏览文件</label><input id="file" type="file" accept=".cr3,.cr2,.crw,.nef,.nrw,.arw,.sr2,.srf,.dng,.orf,.rw2,.raf,.pef,.ptx,.3fr,.fff,.iiq,.kdc,.dcr,.mos,.mrw,.x3f,.tif,.tiff,.jpg,.jpeg">
             </div>
             <div id="fileMeta" class="file-meta"><div id="fileName" class="filename"></div><div id="fileSize" class="filesub"></div><div id="lensMeta" class="meta-line"></div></div>
@@ -54,7 +54,7 @@
             <input id="minRadius" class="range" type="range" min="2" max="24" step="1" value="3">
             <div class="group"><label for="maxRadius">最大柔焦半径</label><span id="maxValue" class="value"></span></div>
             <input id="maxRadius" class="range" type="range" min="8" max="80" step="1" value="42">
-            <p class="hint">此项设置相对于天空区域最亮点源的相对星等差上限，默认 3.0 等。数值越大，纳入的较暗点源越多，达标点源全部处理且不设数量上限。亮度来自 SEP 圆孔径测光，属于画面内相对值，不是星表绝对星等。算法从星点周围实测 RGB 剖面出发，以横纵扩散宽度相同的正圆高斯核生成峰值匹配的光晕，只增加高于原图的部分并保留星点核心；新增光晕不会依据星像长短轴拉成椭圆。强度默认 10、最高 30，控制扩散宽度；光晕不透明度默认 30%，控制光晕增加量，调到 100% 可完整显示设定光晕。亮星获得较宽且更亮的光晕，暗星范围和亮度都会自动收窄。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。</p>
+            <p class="hint">此项设置 Gaia 派生 G 星等相对于本图最亮匹配星的差值上限 ΔG，默认 3.0 等。数值越大，纳入的较暗星点越多；符合范围的星点全部处理，不设数量上限。程序随包携带 ASTAP 与 W08 全天天亮星索引（约完整至 G=8，星等精度 0.1 等），WCS 解算和星表匹配均在本机完成，无需联网。该索引只包含基础亮星，不含 Gaia source_id 或 BP-RP；光晕颜色按图像内测得的逐星 RGB 星色处理。柔焦使用横纵扩散相同的正圆高斯核生成光晕，保留星点核心并使外缘融入背景；亮星获得较宽且更亮的光晕，暗星范围和亮度都会收窄。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。</p>
           </div>
         </div>
         <div class="export-wrap">
@@ -75,7 +75,7 @@
           <div class="track"><div id="bar" class="bar"></div></div>
           <div id="result" class="result"><span id="resultMeta" class="result-meta"></span><a id="download" class="download" href="#">下载 16 位 TIFF</a></div>
         </div>
-        <div class="footer"><span>星点柔焦 v__APP_VERSION__&nbsp; · &nbsp;SEP 点源检测与测光</span><span>文件只传到本机引擎，不上传网站</span></div>
+        <div class="footer"><span>星点柔焦 v__APP_VERSION__&nbsp; · &nbsp;本机 ASTAP + Gaia 亮星星表</span><span>星点解算与星表匹配均离线完成</span></div>
         <button id="exit" class="exit">退出程序</button>
       </section>
     </div>
@@ -107,14 +107,14 @@
     slider("minRadius","minValue",v=>`${v.toFixed(0)} px`);
     slider("maxRadius","maxValue",v=>`${v.toFixed(0)} px`);
     function chooseFile(file){if(!file)return;selectedFile=file;$("fileMeta").classList.add("show");$("fileName").textContent=file.name;$("fileSize").textContent=formatBytes(file.size);$("lensMeta").textContent="处理时读取图像与可用的镜头信息";start.disabled=busy||!engineReady;$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="文件已就绪，可以开始处理";setStatus(engineReady?"图像文件已就绪 · 可调整星点识别与柔焦范围":"请先运行本机星点柔焦程序，再从程序打开网页版",0);}
-    async function checkEngine(){if(!BASE){engineReady=false;start.disabled=true;setStatus("请先下载并打开本机星点柔焦程序；程序启动后会自动连接本网页。",0);return;}try{const response=await fetch(`${BASE}/api/health`);const status=await response.json();if(!response.ok||!status.ok)throw new Error("本机引擎未响应");engineReady=true;start.disabled=!selectedFile;setStatus("已连接本机处理引擎 · 图片不会上传到网站",0);}catch(_){engineReady=false;start.disabled=true;setStatus("无法连接本机引擎，请重新打开星点柔焦程序生成的网页版窗口。",0);}}
+      async function checkEngine(){if(!BASE){engineReady=false;start.disabled=true;setStatus("请先下载并打开本机星点柔焦程序；程序启动后会自动连接本网页。",0);return;}try{const response=await fetch(`${BASE}/api/health`);const status=await response.json();if(!response.ok||!status.ok)throw new Error("本机引擎未响应");engineReady=true;start.disabled=!selectedFile;setStatus("已连接本机引擎 · WCS 解算与亮星星表匹配均在本机完成",0);}catch(_){engineReady=false;start.disabled=true;setStatus("无法连接本机引擎，请重新打开星点柔焦程序生成的网页版窗口。",0);}}
     fileInput.addEventListener("change",e=>chooseFile(e.target.files[0]));
     ["dragenter","dragover"].forEach(name=>drop.addEventListener(name,e=>{e.preventDefault();drop.classList.add("over");}));
     ["dragleave","drop"].forEach(name=>drop.addEventListener(name,e=>{e.preventDefault();drop.classList.remove("over");}));
     drop.addEventListener("drop",e=>chooseFile(e.dataTransfer.files[0]));
-    async function pollJob(id){try{const response=await fetch(`${BASE}/api/jobs/${encodeURIComponent(id)}`);const job=await response.json();if(!response.ok)throw new Error(job.error||"任务状态读取失败");if(job.metadata){const m=job.metadata;const bits=[m.lens||"未记录镜头"];if(m.focalLength)bits.push(`${m.focalLength} mm`);if(m.aperture)bits.push(`f/${m.aperture}`);$("lensMeta").textContent=`${m.width.toLocaleString()} × ${m.height.toLocaleString()} px · ${bits.join(" · ")}`;}
+      async function pollJob(id){try{const response=await fetch(`${BASE}/api/jobs/${encodeURIComponent(id)}`);const job=await response.json();if(!response.ok)throw new Error(job.error||"任务状态读取失败");if(job.metadata){const m=job.metadata;const bits=[m.lens||"未记录镜头"];if(m.focalLength)bits.push(`${m.focalLength} mm`);if(m.aperture)bits.push(`f/${m.aperture}`);$("lensMeta").textContent=`${m.width.toLocaleString()} × ${m.height.toLocaleString()} px · ${bits.join(" · ")}`;}
       setStatus(job.message||"正在处理…",job.percent||0);
-      if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent=`相对星等差上限 Δm≤${job.relativeMagnitudeLimit.toFixed(1)} · 柔焦 ${job.stars.toLocaleString()} / ${job.candidates.toLocaleString()} 个天空点源 · ${job.width.toLocaleString()} × ${job.height.toLocaleString()} · 天光 ${(job.skyBackgroundLevel*100).toFixed(2)}% · 光晕适配 ${job.skyAdaptationGain.toFixed(2)}× · ${job.outputName}`;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
+        if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent="本机 Gaia 亮星表 ΔG≤"+job.relativeMagnitudeLimit.toFixed(1)+" · 柔焦 "+job.stars.toLocaleString()+" / "+job.catalogMatches.toLocaleString()+" 个星表匹配点源 · SEP 检出 "+job.candidates.toLocaleString()+" 个候选 · "+job.width.toLocaleString()+" × "+job.height.toLocaleString()+" · 天光 "+(job.skyBackgroundLevel*100).toFixed(2)+"% · 光晕适配 "+job.skyAdaptationGain.toFixed(2)+"× · "+job.outputName;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
         $("result").classList.add("show");busy=false;start.disabled=false;start.textContent="✦  更改参数后再次处理";setStatus("柔焦完成",100);return;}
       if(job.state==="error")throw new Error(job.message||"处理失败");
       setTimeout(()=>pollJob(id),650);

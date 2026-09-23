@@ -1,21 +1,23 @@
 # 星点柔焦
 
-星点柔焦的 Windows/macOS 本机引擎和 GitHub Pages 网页前端。支持相机 RAW、TIFF 和 JPG，使用 SEP 检测点源与测光，按逐星 RGB 径向 PSF 生成正圆光晕，输出 16 位 TIFF。当前版本见 `version.py`；Windows 构建脚本会在版本 ZIP 已存在时自动递增补丁号。
+星点柔焦的 Windows/macOS 本机引擎和 GitHub Pages 网页前端。支持相机 RAW、TIFF 和 JPG，使用 SEP 检测点源，随包 ASTAP 在本机解算 WCS，再用内置 Gaia 派生亮星索引的 G 星等筛选星点；按逐星 RGB 径向 PSF 生成正圆光晕，输出 16 位 TIFF。Windows/macOS ZIP 均含板解算器与亮星索引，用户无需另装解算器，也无需联网做星表匹配。Windows 构建脚本会在版本 ZIP 已存在时自动递增补丁号。
 
 ## 使用
 
 1. Windows 解压对应版本 ZIP 后双击 `星点柔焦.exe`。macOS 解压对应架构 ZIP 后，在 Finder 中按住 Control 并点按“星点柔焦.app”，选择“打开”。
-2. 程序先打开本机处理界面；点按标题栏的“网页版”可打开 GitHub Pages 前端。网页通过带随机令牌的本机回环连接运行图像处理，图片不会上传至 GitHub。
+2. 程序先打开本机处理界面；点按标题栏的“网页版”可打开 GitHub Pages 前端。图像解码、星点检测与 ASTAP 板解算都在本机完成。
 3. 选择 RAW、TIFF 或 JPG 文件。RAW 会读取可用镜头数据，并依焦距决定星点检测分辨率。
-4. “柔焦星点亮度范围控制”设置相对星等差上限，默认 3.0 等，范围 0–10 等。数值越大，纳入的较暗星点越多；符合范围的点源全部处理，不限制数量。
+4. “柔焦星点亮度范围控制”设置 G 星等相对差上限 ΔG，默认 3.0 等，范围 0–10 等。数值越大，纳入的较暗星点越多；符合范围的点源全部处理，不限制数量。星等来自随包的 Gaia 派生 W08 全天天亮星索引，约完整至 G=8 等，精度为 0.1 等；该亮星索引不包含 source_id 或 BP-RP。
 5. 柔焦强度默认 10、范围 0–30。光晕不透明度独立控制，默认 30%，数值越高光晕越明显。
 6. 完成后下载 16 位 TIFF。
 
 ## 星点和非星点筛选
 
-检测使用 SEP 的局部背景与 RMS、PSF 匹配滤波和圆孔径测光。场景预览按逐行亮度跃变估计地平线，再用低通亮度抑制地景和树木剪影；检测背景和星点通量只统计天空遮罩内像素。点源形态允许圆度低至 0.35、长轴达到 `max(6 px, 5 × PSF σ)`（最高 12 px），避免把亮星、轻微拖线或像差星像误判成扩展目标；更大的弥散结构会被剔除。当地背景 RMS 高于天空全图 4 倍时，只有附近也检测到至少 4 个紧致点源的候选才保留；因此球状星团等拥挤星场中可分辨的成员星仍能柔化，弥散星云结构仍会被排除。此项是基于 SEP 形态与局部紧致源密度的简化拥挤场筛选，并非 DAOPHOT 的 PSF 拟合流程。DAOPHOT 文献讨论了密集星场中的重叠星像及逐星 PSF 测光问题。[Stetson 1987, DAOPHOT](https://articles.adsabs.harvard.edu/pdf/1987PASP...99..191S)
+检测使用 SEP 的局部背景与 RMS、PSF 匹配滤波和圆孔径测光。场景预览按逐行亮度跃变估计地平线，再用低通亮度抑制地景和树木剪影；检测背景和候选星点只统计天空遮罩内像素。点源形态允许圆度低至 0.35、长轴达到 max(6 px, 5 × PSF σ)（最高 12 px），避免把亮星、轻微拖线或像差星像误判为扩展目标；更大的弥散结构会被剔除。当地背景 RMS 高于天空全图 4 倍时，只有附近也检测到至少 4 个紧致点源的候选才保留；因此球状星团等拥挤星场中可分辨的成员星仍能柔化，弥散星云结构仍会被排除。此项是基于 SEP 形态与局部紧致源密度的简化拥挤场筛选，并非 DAOPHOT 的 PSF 拟合流程。[Stetson 1987, DAOPHOT](https://articles.adsabs.harvard.edu/pdf/1987PASP...99..191S)
 
-单张图像里，紧凑星系或树枝上的孤立灯点有时会与真实星点具有相近 PSF；仅凭像素无法保证区分所有此类目标。这里的球状星团支持指其图像中可分辨的紧致成员星，不把未分辨的整个团状光斑作为单颗星处理。控制值是 SEP 孔径测光得到的相对星等差上限 `Δm=-2.5 log10(F/Fmax)`；筛选条件为 `F/Fmax ≥ 10^(-0.4×Δm上限)`，不是 Gaia 目录的绝对星等。Gaia DR3 有 G、BP、RP 测光，`BP-RP` 是目录颜色指数；将其用于图像目标需要 WCS 天球坐标及星表匹配。Nova/Astrometry 服务未部署时，程序不冒称使用了星表星等；星色取自源图 RGB 孔径测光。[Gaia DR3 星表字段](https://gea.esac.esa.int/archive/documentation/GDR3/Gaia_archive/chap_datamodel/sec_dm_main_tables/ssec_dm_gaia_source.html)
+本机板解算使用随包 ASTAP 命令行程序与 D05/G05/W08 索引。RAW/TIFF/JPG 的全分辨率 16 位灰度副本只用于解算；星点位置经 WCS 映射后，与随包 ASTAP W08 全天天亮星索引在本机交叉匹配。W08 索引最多提供约 G=8 等的 Gaia 派生 G 星等，精度为 0.1 等；亮星足够时，处理完全离线，不把图像或天球坐标发送到网络，也不创建云端任务。索引没有 Gaia source_id 或 BP-RP，光晕颜色按图像内测得的逐星 RGB 星色处理。相机焦距/画幅信息不足或板解算无法通过视场比例检查时，程序会停止并说明原因，不会退回用画面亮度冒充目录星等。极宽视场由多个重叠小视场本机解算；相机 EXIF 不提供 35 mm 等效焦距时，只能依据程序内已识别的相机型号估算画幅。
+
+控制值是本地 W08 G 星等相对于本图最亮匹配星的差值 ΔG=G−G最亮；筛选条件为 ΔG≤上限，不以 SEP 孔径通量替代目录测光。W08 不含 Gaia 蓝/红通带颜色，光晕的 RGB 通道比例取自已显影源图的星色剖面。
 
 ## 光晕算法
 
@@ -26,12 +28,13 @@
 光晕扩散半径沿用 `18ffa10` 中基于相对星等的映射：
 
 ```text
-q_i = ln(F_i / F_min) / ln(F_max / F_min)
+F_i = 10^(-0.4 × (G_i - G_brightest))
+q_i = ln(F_i / F_faintest) / ln(F_brightest / F_faintest)
 R_i = r_min + (r_max - r_min) × q_i
 A_i ∝ F_i / F_max
 ```
 
-其中 `F_i` 是该星 SEP 圆孔径通量，`F_min` / `F_max` 是本次选中星点的最暗 / 最亮通量。最暗星落在最小半径，亮星随亮度逐渐扩大；光晕半径上下限可调。扩散核宽度按 `σ = (R_i/3) × sqrt(strength/40)` 计算，默认强度 10、最大 30；光晕不透明度直接控制正向增亮图层的混合量。亮度还按星点相对通量自动缩放，因此暗星获得更窄、更暗的光晕。因为输入 PSF 剖面按逐星 RGB 实测，输出保留星点颜色。每个光晕范围以正圆遮罩限定，边缘平滑融合到背景。
+其中 `G_i` 是随包 W08 索引提供的 Gaia 派生 G 星等（0.1 等精度），`F_i` 为相对目录通量；`F_faintest` / `F_brightest` 是本次选中星点中的最暗 / 最亮相对目录通量。最暗星落在最小半径，亮星随目录星等非线性地扩大；光晕半径上下限可调。扩散核宽度按 `σ = (R_i/3) × sqrt(strength/40)` 计算，默认强度 10、最大 30；光晕不透明度直接控制正向增亮图层的混合量。亮度还按目录相对通量自动缩放，因此暗星获得更窄、更暗的光晕。因为输入 PSF 剖面按逐星 RGB 实测，输出保留星点颜色。每个光晕范围以正圆遮罩限定，边缘平滑融合到背景。
 
 以卷积前后 PSF 形状确定目标光晕，再按目标峰值构成带原背景的 RGB 图层，只叠加目标高于原图的正差值。光晕不透明度直接控制这部分增加量；调到 100% 时，局部会达到完整的峰值匹配光晕效果。遮罩在圆形外缘使用 smoothstep 逐渐衰减，遮罩外像素不变；横纵扩散 σ 相等，遮罩只由欧氏距离决定，因此新增光晕保持正圆。各颜色通道分别使用原图径向剖面和实测星色。
 
@@ -47,7 +50,7 @@ A_i ∝ F_i / F_max
 
 ## 从源码构建
 
-Windows 构建需要 64 位 Python 3.12 和网络连接以安装依赖。双击 `build.ps1` 或在 PowerShell 执行：
+Windows 构建需要 64 位 Python 3.12 和网络连接，用于安装依赖并下载 ASTAP 程序及 D05/G05/W08 星表索引。构建 ZIP 已包含这些组件，用户无需单独安装解算器。双击 `build.ps1` 或在 PowerShell 执行：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -64,5 +67,5 @@ GitHub Pages 前端由 `.github/workflows/pages.yml` 自动构建和发布。网
 
 - [SEP 源提取、背景与孔径测光](https://sep.readthedocs.io/en/stable/tutorial.html)、[PSF 匹配滤波](https://sep.readthedocs.io/en/stable/filter.html)
 - [SciPy 高斯滤波与二维卷积实现](https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.gaussian_filter.html)、[二维高斯卷积核定义](https://docs.astropy.org/en/latest/api/astropy.convolution.Gaussian2DKernel.html)
-- [Gaia DR3 星表数据模型](https://gea.esac.esa.int/archive/documentation/GDR3/Gaia_archive/chap_datamodel/sec_dm_main_tables/ssec_dm_gaia_source.html)
+- [ASTAP 命令行板解算器与 W08 星表说明](https://www.hnsky.org/astap.htm)；程序包内附完整 ASTAP MPL-2.0 许可证、上游源码链接、Gaia/ESA/DPAC 归属与数据库 acknowledgement。
 - [rawpy / LibRaw](https://github.com/LibRaw/LibRaw)、[tifffile](https://github.com/cgohlke/tifffile)、[PyInstaller](https://github.com/pyinstaller/pyinstaller)

@@ -6,6 +6,8 @@ on:
     paths:
       - "app.py"
       - "processor.py"
+      - "plate_solver.py"
+      - "scripts/prepare_astap.py"
       - "requirements.txt"
       - "ui/index.html"
       - "version.py"
@@ -142,5 +144,5 @@ jobs:
             gh release create "$tag" release-assets/* \
               --target "$GITHUB_SHA" \
               --title "星点柔焦 ${version}" \
-              --notes "Windows、macOS Apple 芯片与 Intel 版本。macOS 包目前未使用 Apple Developer ID 签名或公证。"
+              --notes "Windows、macOS Apple 芯片与 Intel 版本，均包含 ASTAP 本机板解算器和 Gaia 派生的 W08 全天天亮星索引（约 G=8）。星点解算和亮星匹配全程离线；macOS 包目前未使用 Apple Developer ID 签名或公证。"
           fi

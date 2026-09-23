@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import tempfile
 import threading
 import xml.etree.ElementTree as ET
 from io import BytesIO
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -19,6 +21,7 @@ from scipy.ndimage import gaussian_filter, zoom
 from PIL import ExifTags, Image, ImageCms, ImageOps
 
 from version import APP_VERSION
+from plate_solver import match_local_bright_stars
 
 
 Progress = Callable[[int, str], None]
@@ -36,6 +39,7 @@ class RawInfo:
     focal_length: float | None
     aperture: float | None
     preview: Image.Image | None
+    focal_length_35mm: float | None = None
 
 
 MetadataCallback = Callable[[RawInfo], None]
@@ -66,6 +70,11 @@ class Star:
     theta: float = 0.0
     signal_to_noise: float = 0.0
     crowded_field: bool = False
+    image_flux: float | None = None
+    catalog_g_mag: float | None = None
+    catalog_bp_rp: float | None = None
+    catalog_source_id: int | None = None
+    catalog_delta_magnitude: float | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +83,7 @@ class ProcessResult:
     star_count: int
     candidate_count: int
     selected_count: int
+    catalog_match_count: int
     relative_magnitude_limit: float
     width: int
     height: int
@@ -106,9 +116,16 @@ def _raw_info(raw: rawpy.RawPy, preview: Image.Image | None = None) -> RawInfo:
     sizes = raw.sizes
     other = raw.other
     lens_data = raw.lens
-    # rawpy exposes lens and exposure fields but not the camera body strings.
-    # Keep that distinction visible rather than presenting the lens as the body.
-    camera = "相机型号未读取"
+    preview_exif = preview.getexif() if preview is not None else {}
+    camera = " ".join(part for part in (
+        _clean_text(preview_exif.get(271, "")),
+        _clean_text(preview_exif.get(272, "")),
+    ) if part) or "相机型号未读取"
+    try:
+        preview_exif_ifd = preview_exif.get_ifd(ExifTags.IFD.Exif) if preview_exif else {}
+    except Exception:
+        preview_exif_ifd = {}
+    focal_35mm = _as_float(preview_exif_ifd.get(41989))
     lens_name = " ".join(
         part for part in (_clean_text(lens_data.make), _clean_text(lens_data.model)) if part
     ) or "未记录镜头"
@@ -126,6 +143,7 @@ def _raw_info(raw: rawpy.RawPy, preview: Image.Image | None = None) -> RawInfo:
         focal_length=focal if math.isfinite(focal) and focal > 0 else None,
         aperture=aperture if math.isfinite(aperture) and aperture > 0 else None,
         preview=preview,
+        focal_length_35mm=focal_35mm,
     )
 
 
@@ -466,6 +484,72 @@ def _raster_detector_image(rgb: np.ndarray, focal_length: float | None) -> tuple
     return np.ascontiguousarray(proxy, dtype=np.float32), factor
 
 
+def _write_solver_grayscale(
+    image: np.ndarray,
+    output_path: Path,
+    sky_mask: np.ndarray | None = None,
+) -> None:
+    """Write a contrast-stretched, sky-only, full-resolution 16-bit solve proxy."""
+    height, width = image.shape[:2]
+    sample = np.asarray(image[::16, ::16], dtype=np.float32)
+    if sample.ndim == 3:
+        sample = np.max(sample[..., :3], axis=2)
+    valid_reference = np.isfinite(sample)
+    if sky_mask is not None and sky_mask.ndim == 2:
+        sample_y = np.minimum(
+            (np.arange(sample.shape[0], dtype=np.float64) * sky_mask.shape[0] / sample.shape[0]).astype(np.intp),
+            sky_mask.shape[0] - 1,
+        )
+        sample_x = np.minimum(
+            (np.arange(sample.shape[1], dtype=np.float64) * sky_mask.shape[1] / sample.shape[1]).astype(np.intp),
+            sky_mask.shape[1] - 1,
+        )
+        sample_foreground = sky_mask[sample_y[:, None], sample_x[None, :]]
+        sky_reference_mask = valid_reference & ~sample_foreground
+        if np.any(sky_reference_mask):
+            valid_reference = sky_reference_mask
+    valid_reference = sample[valid_reference]
+    if not valid_reference.size:
+        raise ValueError("无法为本机板解算生成有效的天空灰度参考。")
+    low, high = np.percentile(valid_reference, (0.2, 99.8))
+    if not math.isfinite(float(low)) or not math.isfinite(float(high)) or high <= low:
+        raise ValueError("天空亮度范围不足，无法生成本机板解算图像。")
+
+    x_indices: np.ndarray | None = None
+    if sky_mask is not None and sky_mask.ndim == 2:
+        x_indices = np.minimum(
+            (np.arange(width, dtype=np.float64) * sky_mask.shape[1] / width).astype(np.intp),
+            sky_mask.shape[1] - 1,
+        )
+    target = tifffile.memmap(
+        output_path,
+        shape=(height, width),
+        dtype=np.uint16,
+        photometric="minisblack",
+        metadata=None,
+    )
+    try:
+        for y0 in range(0, height, 512):
+            rows = np.array(image[y0:min(height, y0 + 512)], dtype=np.float32, copy=True)
+            if rows.ndim == 3:
+                rows = np.max(rows[..., :3], axis=2)
+            np.nan_to_num(rows, copy=False, nan=float(low), posinf=float(high), neginf=float(low))
+            if sky_mask is not None and x_indices is not None:
+                y_indices = np.minimum(
+                    (np.arange(y0, y0 + rows.shape[0], dtype=np.float64) * sky_mask.shape[0] / height).astype(np.intp),
+                    sky_mask.shape[0] - 1,
+                )
+                foreground = sky_mask[y_indices[:, None], x_indices[None, :]]
+                rows[foreground] = float(low)
+            np.subtract(rows, low, out=rows)
+            np.divide(rows, high - low, out=rows)
+            np.clip(rows, 0.0, 1.0, out=rows)
+            target[y0:y0 + rows.shape[0]] = np.rint(rows * 65535.0).astype(np.uint16)
+        target.flush()
+    finally:
+        del target
+
+
 def _orient_array(array: np.ndarray, orientation: int) -> np.ndarray:
     """Apply TIFF/EXIF orientation to pixels, returning orientation 1 data."""
     if orientation == 2:
@@ -516,11 +600,41 @@ def _to_unit_float(pixels: np.ndarray, bits: int) -> np.ndarray:
     return np.clip(pixels.astype(np.float32), 0.0, 1.0)
 
 
+def _inherit_sibling_raw_metadata(path: Path, info: RawInfo) -> RawInfo:
+    if info.focal_length is not None and info.focal_length_35mm is not None:
+        return info
+    raw_extensions = (
+        ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".sr2", ".srf", ".dng",
+        ".orf", ".rw2", ".raf", ".pef", ".ptx", ".3fr", ".fff", ".iiq", ".kdc",
+        ".dcr", ".mos", ".mrw", ".x3f",
+    )
+    for suffix in raw_extensions:
+        candidate = path.with_suffix(suffix)
+        if not candidate.is_file():
+            candidate = path.with_suffix(suffix.upper())
+        if not candidate.is_file():
+            continue
+        try:
+            raw_info = read_raw_info(candidate)
+        except Exception:
+            continue
+        return replace(
+            info,
+            camera=info.camera if info.camera and "未记录" not in info.camera else raw_info.camera,
+            lens=info.lens if info.focal_length is not None and info.lens != "未记录镜头" else raw_info.lens,
+            focal_length=info.focal_length or raw_info.focal_length,
+            aperture=info.aperture or raw_info.aperture,
+            focal_length_35mm=info.focal_length_35mm or raw_info.focal_length_35mm,
+        )
+    return info
+
+
 def _read_raster(path: Path) -> RasterInput:
     suffix = path.suffix.lower()
     camera = ""
     lens = ""
     focal = None
+    focal_35mm = None
     aperture = None
     alpha: np.ndarray | None = None
     invert_gray = False
@@ -581,12 +695,19 @@ def _read_raster(path: Path) -> RasterInput:
             lens_tag = page.tags.get("LensModel") or page.tags.get(42036)
             focal_tag = page.tags.get("FocalLength") or page.tags.get(37386)
             aperture_tag = page.tags.get("FNumber") or page.tags.get(33437)
+            description_tag = page.tags.get("ImageDescription")
+            try:
+                stored_metadata = json.loads(str(description_tag.value)) if description_tag else {}
+            except (TypeError, ValueError):
+                stored_metadata = {}
             make = _clean_text(make_tag.value if make_tag is not None else "")
             model = _clean_text(model_tag.value if model_tag is not None else "")
-            camera = " ".join(part for part in (make, model) if part)
-            lens = _clean_text(lens_tag.value if lens_tag is not None else "")
-            focal = _as_float(focal_tag.value if focal_tag is not None else None)
-            aperture = _as_float(aperture_tag.value if aperture_tag is not None else None)
+            camera = " ".join(part for part in (make, model) if part) or _clean_text(stored_metadata.get("camera"))
+            lens = _clean_text(lens_tag.value if lens_tag is not None else stored_metadata.get("lens"))
+            focal = _as_float(focal_tag.value if focal_tag is not None else stored_metadata.get("focal_length_mm"))
+            equivalent_tag = page.tags.get("FocalLengthIn35mmFilm") or page.tags.get(41989)
+            focal_35mm = _as_float(equivalent_tag.value if equivalent_tag is not None else stored_metadata.get("focal_length_35mm_equivalent"))
+            aperture = _as_float(aperture_tag.value if aperture_tag is not None else stored_metadata.get("aperture"))
             input_kind = "TIFF"
     elif suffix in {".jpg", ".jpeg"}:
         with Image.open(path) as image:
@@ -616,6 +737,7 @@ def _read_raster(path: Path) -> RasterInput:
             )
             lens = _clean_text(exif_ifd.get(42036, ""))
             focal = _as_float(exif_ifd.get(37386))
+            focal_35mm = _as_float(exif_ifd.get(41989))
             aperture = _as_float(exif_ifd.get(33437))
             input_kind = "JPG"
     else:
@@ -637,7 +759,9 @@ def _read_raster(path: Path) -> RasterInput:
         focal_length=focal,
         aperture=aperture,
         preview=None,
+        focal_length_35mm=focal_35mm,
     )
+    info = _inherit_sibling_raw_metadata(path, info)
     return RasterInput(
         pixels=pixels,
         alpha=alpha_float,
@@ -654,16 +778,13 @@ def _read_raster(path: Path) -> RasterInput:
 def detect_stars(
     detector: np.ndarray,
     sensitivity: float,
-    relative_magnitude_limit: float = 3.0,
     detection_mask: np.ndarray | None = None,
 ) -> tuple[list[Star], int, int, float]:
-    """Return SEP point sources within a relative aperture-magnitude range."""
+    """Return every SEP point-source candidate for later Gaia catalogue matching."""
     data = np.ascontiguousarray(detector, dtype=np.float32)
     mask = np.ascontiguousarray(detection_mask, dtype=bool) if detection_mask is not None else None
     if mask is not None and mask.shape != data.shape:
         raise ValueError("星空遮罩尺寸与星点检测图像不一致。")
-    relative_magnitude_limit = float(np.clip(relative_magnitude_limit, 0.0, 10.0))
-    relative_flux_floor = 10.0 ** (-0.4 * relative_magnitude_limit)
     background = sep.Background(data, mask=mask, bw=64, bh=64, fw=3, fh=3)
     global_sky = float(np.clip(background.globalback, 0.0, 1.0))
     signal = np.ascontiguousarray(data - background.back(), dtype=np.float32)
@@ -799,13 +920,9 @@ def detect_stars(
     candidate_count = int(len(indices))
     brightest_flux = float(np.max(flux))
     relative_flux = flux / max(brightest_flux, 1e-20)
-    eligible = relative_flux >= relative_flux_floor
-    eligible_indices = np.flatnonzero(eligible)
-    selected_count = int(len(eligible_indices))
-    if selected_count == 0:
-        return [], candidate_count, 0, global_sky
+    selected_count = candidate_count
     signal_to_noise = flux / np.maximum(flux_error, 1e-20)
-    order = eligible_indices[np.argsort(flux[eligible_indices])[::-1]]
+    order = np.argsort(flux)[::-1]
     stars = [
         Star(
             float(objects["x"][indices[i]]),
@@ -1068,9 +1185,13 @@ def _soften_stars(
             "x_px": round(cx, 2),
             "y_px": round(cy, 2),
             "halo_geometry": "circle; isotropic x/y Gaussian convolution",
-            "aperture_flux": round(float(star.flux), 7),
+            "aperture_flux_image_units": round(float(star.image_flux if star.image_flux is not None else star.flux), 7),
+            "catalog_source_id": star.catalog_source_id,
+            "catalog_g_magnitude": round(float(star.catalog_g_mag), 1) if star.catalog_g_mag is not None else None,
+            "catalog_bp_rp_colour_index": round(float(star.catalog_bp_rp), 5) if star.catalog_bp_rp is not None else None,
+            "gaia_delta_g_from_brightest": round(float(star.catalog_delta_magnitude), 5) if star.catalog_delta_magnitude is not None else None,
             "relative_flux_ratio": round(float(star.relative_flux_ratio), 6),
-            "radius_curve": "linear response to relative stellar magnitude; log(aperture_flux/faintest_selected_flux)",
+            "radius_curve": "linear response to relative Gaia G magnitude; log(catalog_flux/faintest_selected_flux)",
             "source_signal_to_noise": round(float(star.signal_to_noise), 3),
             "radius_response": round(float(item["radius_response"]), 5),
             "halo_flux_scale": round(float(item["halo_flux_scale"]), 6),
@@ -1150,7 +1271,7 @@ def process_raw(
         sky_mask, sky_mask_info = _sky_detection_mask(raster.pixels, detector.shape)
         report(12, "正在识别星点与测量亮度…")
         stars, candidate_count, selected_count, sky_background_level = detect_stars(
-            detector, sensitivity, relative_magnitude_limit, sky_mask
+            detector, sensitivity, sky_mask
         )
         image_data = raster.pixels
         profile = raster.profile
@@ -1190,7 +1311,7 @@ def process_raw(
             )
             report(12, "正在识别星点与测量亮度…")
             stars, candidate_count, selected_count, sky_background_level = detect_stars(
-                detector, sensitivity, relative_magnitude_limit, sky_mask
+                detector, sensitivity, sky_mask
             )
             raw_acr_reference_median, raw_acr_reference_name = _acr_reference_luminance_median(input_path)
             if preview is not None:
@@ -1260,7 +1381,72 @@ def process_raw(
         input_kind = "RAW"
         encoding = "RAW developed to 16-bit sRGB with XMP/sRGB-preview or matching Adobe Camera Raw TIFF exposure calibration and highlight preservation; halo processing uses float32 linear-light values; sRGB ICC profile embedded"
 
-    report(63, "图像解码完成，按星点亮度与 PSF 形状柔化…")
+    report(45, "图像解码完成，正在本机解算星空坐标…")
+    solver_scale_xy = (
+        image_data.shape[1] / detector.shape[1],
+        image_data.shape[0] / detector.shape[0],
+    )
+    primary_solver_path: Path | None = None
+    if input_path.suffix.lower() in {".tif", ".tiff"}:
+        try:
+            with tifffile.TiffFile(input_path) as source_tiff:
+                source_page = source_tiff.pages[0]
+                orientation_tag = source_page.tags.get("Orientation")
+                source_orientation = int(orientation_tag.value) if orientation_tag is not None else 1
+                if (
+                    source_orientation == 1
+                    and source_page.imagelength == image_data.shape[0]
+                    and source_page.imagewidth == image_data.shape[1]
+                ):
+                    primary_solver_path = input_path
+        except (OSError, ValueError, tifffile.TiffFileError):
+            primary_solver_path = None
+    with tempfile.TemporaryDirectory(prefix="starsoft-solver-image-") as solver_directory:
+        solver_image_path = Path(solver_directory) / "solver_16bit.tif"
+        _write_solver_grayscale(image_data, solver_image_path, sky_mask)
+        catalog_matches, catalog_position_count = match_local_bright_stars(
+            stars,
+            detector,
+            sky_mask,
+            info,
+            solver_image_path,
+            solver_scale_xy,
+            primary_solver_path,
+            progress=report,
+        )
+    catalog_match_count = len(catalog_matches)
+    if catalog_match_count == 0:
+        raise ValueError("随程序提供的 Gaia 亮星索引没有找到本图对应星点；请确认照片星点清晰并且 EXIF 镜头信息完整。")
+    reference_g_mag = min(match.g_mag for match in catalog_matches.values())
+    catalog_stars: list[Star] = []
+    for detection_index, star in enumerate(stars):
+        match = catalog_matches.get(detection_index)
+        if match is None:
+            continue
+        delta_g = max(0.0, float(match.g_mag - reference_g_mag))
+        if delta_g > relative_magnitude_limit:
+            continue
+        relative_catalog_flux = 10.0 ** (-0.4 * delta_g)
+        bp_rp = (
+            float(match.bp_mag - match.rp_mag)
+            if match.bp_mag is not None and match.rp_mag is not None
+            else None
+        )
+        catalog_stars.append(replace(
+            star,
+            flux=relative_catalog_flux,
+            relative_flux_ratio=relative_catalog_flux,
+            image_flux=star.flux,
+            catalog_g_mag=match.g_mag,
+            catalog_bp_rp=bp_rp,
+            catalog_source_id=match.source_id,
+            catalog_delta_magnitude=delta_g,
+        ))
+    stars = sorted(catalog_stars, key=lambda star: star.catalog_g_mag if star.catalog_g_mag is not None else math.inf)
+    selected_count = len(stars)
+    if selected_count == 0:
+        raise ValueError("Gaia DR3 星表匹配成功，但所选相对星等范围内没有星点；请增大亮度范围控制值。")
+    report(61, f"本机亮星星表匹配 {catalog_match_count:,} 个点源，其中 {selected_count:,} 个符合 ΔG 范围，正在柔焦…")
     star_measurements = _soften_stars(
         image_data,
         stars,
@@ -1294,18 +1480,24 @@ def process_raw(
         "camera": info.camera,
         "lens": info.lens,
         "focal_length_mm": info.focal_length,
+        "focal_length_35mm_equivalent": info.focal_length_35mm,
         "aperture": info.aperture,
         "detected_stars": len(stars),
         "point_source_candidates": candidate_count,
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
-        "star_selection": "all SEP point sources within the selected relative aperture-magnitude range; instrumental photometry, not catalog apparent magnitude",
+        "star_selection": "ASTAP W08 all-sky bright-star index with Gaia-derived G magnitudes rounded to 0.1 mag; select matched sources within delta G of the brightest local catalogue match",
+        "catalog": "Bundled ASTAP W08 Gaia-derived all-sky bright-star index (approximately complete through G=8); WCS solving and coordinate cross-match are local and offline",
+        "catalog_match_count": catalog_match_count,
+        "catalog_position_count_checked_locally": catalog_position_count,
+        "catalog_reference_g_magnitude": round(reference_g_mag, 5),
+        "catalog_photometry_fields": ["Gaia-derived G magnitude (W08, 0.1 mag resolution)"],
         "relative_magnitude_limit": relative_magnitude_limit,
         "relative_flux_floor_ratio": round(10.0 ** (-0.4 * relative_magnitude_limit), 8),
-        "relative_magnitude_difference_definition": "delta_magnitude=-2.5*log10(flux_ratio), relative to the brightest point source in the detected sky area; include candidates where delta_magnitude is at most the selected limit",
+        "relative_magnitude_difference_definition": "delta_G=local W08 G magnitude minus the brightest matched W08 G magnitude; include catalogue-matched point sources where delta_G is at most the selected limit",
         "soft_focus": "strictly circular isotropic Gaussian diffusion convolved with an RGB stellar radial profile sampled by circular-annulus medians; x and y sigma are equal and SEP ellipticity/angle never shapes the halo; the convolved profile is peak-matched to the historical relative-flux and color response, then only positive lightening difference is blended over the source with a circular smoothstep feather mask",
         "halo_geometry": "strictly circular; Euclidean radial bins and equal x/y Gaussian sigma; source ellipticity and position angle are not used to shape the halo",
-        "brightness_to_radius_curve": "linear response to relative stellar magnitude: log(aperture_flux/faintest_selected_flux) normalized to brightest selected star, matching 18ffa10 mapping",
-        "brightness_to_halo_strength_curve": "each selected star's measured RGB radial profile is scattered by an isotropic Gaussian kernel and peak-matched to the historical relative-flux color response; SEP aperture flux sets both its relative-magnitude radius and halo amplitude, so faint stars receive a narrower and dimmer halo",
+        "brightness_to_radius_curve": "linear response to relative local W08 G magnitude rounded to 0.1 mag: log(catalog_flux/faintest_selected_flux) normalized to the brightest selected catalogue source, matching 18ffa10 mapping",
+        "brightness_to_halo_strength_curve": "each selected star's measured RGB radial profile is scattered by an isotropic Gaussian kernel and peak-matched to the local catalogue G-band relative flux; per-channel halo colour comes from the source image RGB profile",
         "soft_focus_strength": round(strength, 1),
         "soft_focus_strength_note": "Gaussian scattering-kernel sigma=(radius/3)*sqrt(strength/40); default strength 10, maximum 30; opacity controls the blend amount independently",
         "soft_focus_opacity_percent": round(opacity, 1),
@@ -1359,6 +1551,7 @@ def process_raw(
         star_count=len(stars),
         candidate_count=candidate_count,
         selected_count=selected_count,
+        catalog_match_count=catalog_match_count,
         relative_magnitude_limit=relative_magnitude_limit,
         width=int(pixels16.shape[1]),
         height=int(pixels16.shape[0]),

@@ -5,3 +5,4 @@ scipy>=1.15
 tifffile>=2025.5
 Pillow>=11
 pyinstaller>=6.10
+astropy>=7.0
