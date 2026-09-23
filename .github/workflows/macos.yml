@@ -1,4 +1,4 @@
-name: Build macOS releases
+name: Build desktop releases
 
 on:
   push:
@@ -12,6 +12,7 @@ on:
       - "README.md"
       - "LICENSE"
       - "build_macos.sh"
+      - "build.ps1"
       - ".github/workflows/macos.yml"
   workflow_dispatch:
 
@@ -19,7 +20,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: macos-release-${{ github.ref }}
+  group: desktop-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -53,9 +54,30 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build executable and zip
+        shell: pwsh
+        run: .\build.ps1
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: releases/星点柔焦-v*-win-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
   publish:
     name: Publish versioned release assets
-    needs: build
+    needs: [build, build-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -66,6 +88,11 @@ jobs:
           pattern: macos-*
           merge-multiple: true
           path: release-source
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-release
+          path: windows-source
       - name: Add Windows build and publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -74,14 +101,14 @@ jobs:
           set -euo pipefail
           version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' version.py)"
           tag="v${version}"
-          windows_zip="releases/星点柔焦-v${version}-win-x64.zip"
-          test -f "$windows_zip"
           mkdir -p release-assets
           for arch in arm64 x64; do
             source_zip="$(find release-source -maxdepth 1 -type f -name "*-macos-${arch}.zip" -print -quit)"
             test -n "$source_zip"
             cp "$source_zip" "release-assets/starsoft-v${version}-macos-${arch}.zip"
           done
+          windows_zip="$(find windows-source -maxdepth 1 -type f -name "*-win-x64.zip" -print -quit)"
+          test -n "$windows_zip"
           cp "$windows_zip" "release-assets/starsoft-v${version}-win-x64.zip"
           (
             cd release-assets

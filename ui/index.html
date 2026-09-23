@@ -54,12 +54,12 @@
             <input id="minRadius" class="range" type="range" min="2" max="24" step="1" value="3">
             <div class="group"><label for="maxRadius">最大柔焦半径</label><span id="maxValue" class="value"></span></div>
             <input id="maxRadius" class="range" type="range" min="8" max="80" step="1" value="42">
-            <p class="hint">此项设置相对于天空区域最亮点源的相对星等差上限，默认 3.0 等。数值越大，纳入的较暗点源越多，达标点源全部处理且不设数量上限。亮度来自 SEP 圆孔径测光，属于画面内相对值，不是星表绝对星等。算法从星点周围实测 RGB 剖面出发，以横纵扩散宽度相同的正圆高斯核作卷积：核心随光线扩散而减弱，外圈形成渐淡的正圆光晕；不会依据星像长短轴拉成椭圆。强度默认 10、最高 30，控制扩散宽度；光晕不透明度默认 30%，单独控制卷积结果的混合量。亮星获得较宽范围，暗星范围自动收窄。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。</p>
+            <p class="hint">此项设置相对于天空区域最亮点源的相对星等差上限，默认 3.0 等。数值越大，纳入的较暗点源越多，达标点源全部处理且不设数量上限。亮度来自 SEP 圆孔径测光，属于画面内相对值，不是星表绝对星等。算法从星点周围实测 RGB 剖面出发，以横纵扩散宽度相同的正圆高斯核生成峰值匹配的光晕，只增加高于原图的部分并保留星点核心；新增光晕不会依据星像长短轴拉成椭圆。强度默认 10、最高 30，控制扩散宽度；光晕不透明度默认 30%，控制光晕增加量，调到 100% 可完整显示设定光晕。亮星获得较宽且更亮的光晕，暗星范围和亮度都会自动收窄。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。</p>
           </div>
         </div>
         <div class="export-wrap">
           <div class="section-index">03 &nbsp;/&nbsp; 输出</div>
-          <div class="card export"><div><b>TIFF · 16 位 · 保留输入色彩空间</b><br><span>TIFF/JPG 保留 ICC；RAW 显影为 sRGB</span></div><span>原 ICC 有则保留</span></div>
+          <div class="card export"><div><b>TIFF · 16 位 · 保留输入色彩空间</b><br><span>float32 全程处理；TIFF/JPG 保留 ICC，RAW 显影为 sRGB</span></div><span>最终写出 16 位</span></div>
         </div>
         <div class="start-wrap"><button id="start" class="primary" disabled>✦ &nbsp;开始星点柔焦</button></div>
       </section>

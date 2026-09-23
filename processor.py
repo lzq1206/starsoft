@@ -15,8 +15,8 @@ import numpy as np
 import rawpy
 import sep
 import tifffile
-from scipy.ndimage import gaussian_filter
-from PIL import ExifTags, Image, ImageCms, ImageFilter, ImageOps
+from scipy.ndimage import gaussian_filter, zoom
+from PIL import ExifTags, Image, ImageCms, ImageOps
 
 from version import APP_VERSION
 
@@ -151,19 +151,20 @@ def _extract_raw_preview(raw: rawpy.RawPy) -> Image.Image | None:
     return ImageOps.exif_transpose(preview)
 
 
-def _preview_linear_luminance_median(preview: Image.Image) -> float:
-    """Measure the embedded preview's median luminance in linear sRGB."""
+def _preview_linear_luminance_median(preview: Image.Image) -> float | None:
+    """Measure an sRGB embedded preview without changing its ICC colour space."""
     profile = preview.info.get("icc_profile")
     if profile:
         try:
-            preview = ImageCms.profileToProfile(
-                preview,
-                ImageCms.ImageCmsProfile(BytesIO(profile)),
-                ImageCms.createProfile("sRGB"),
-                outputMode="RGB",
-            )
+            description = ImageCms.getProfileDescription(
+                ImageCms.ImageCmsProfile(BytesIO(profile))
+            ).lower()
         except Exception:
-            preview = preview.convert("RGB")
+            return None
+        if "srgb" not in description:
+            # An embedded preview is only an exposure reference. Avoid an
+            # 8-bit ICC transform here; fall back to XMP exposure instead.
+            return None
     rgb = np.asarray(preview.convert("RGB"), dtype=np.float32) / 255.0
     low = rgb <= 0.04045
     rgb[low] /= 12.92
@@ -259,18 +260,12 @@ def _acr_reference_luminance_median(raw_path: Path) -> tuple[float | None, str |
             source_profile = ImageCms.ImageCmsProfile(BytesIO(profile))
             profile_description = ImageCms.getProfileDescription(source_profile).lower()
             if "srgb" not in profile_description:
-                encoded8 = Image.fromarray(np.rint(np.clip(encoded, 0.0, 1.0) * 255.0).astype(np.uint8), "RGB")
-                srgb8 = ImageCms.profileToProfile(
-                    encoded8,
-                    source_profile,
-                    ImageCms.createProfile("sRGB"),
-                    outputMode="RGB",
-                )
-                encoded = np.asarray(srgb8, dtype=np.float32) / 255.0
+                # Do not convert the reference into sRGB through an 8-bit
+                # intermediary. This auxiliary brightness estimate is only
+                # colorimetrically comparable when the source is sRGB.
+                return None, None
         except Exception:
-            # A malformed profile must not prevent RAW processing. Camera Raw TIFF
-            # files without a readable profile are interpreted as sRGB below.
-            pass
+            return None, None
     low = encoded <= 0.04045
     encoded[low] /= 12.92
     encoded[~low] = np.power((encoded[~low] + 0.055) / 1.055, 2.4)
@@ -284,25 +279,35 @@ def _sky_detection_mask(
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Mask ground and dark foreground silhouettes using the rendered scene preview."""
     if isinstance(reference, Image.Image):
-        image = reference.convert("RGB")
+        values = np.asarray(reference.convert("RGB"), dtype=np.float32) / 255.0
+        values = values @ np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
     else:
-        values = np.asarray(reference)
+        original = np.asarray(reference)
+        values = original.astype(np.float32, copy=True)
         if values.ndim == 3:
             values = values[..., :3].astype(np.float32, copy=False) @ np.asarray(
                 [0.2126, 0.7152, 0.0722], dtype=np.float32
             )
-        values = np.asarray(values, dtype=np.float32)
-        scale = 255.0 if values.size and float(np.nanmax(values)) <= 1.5 else 1.0
-        gray8 = np.rint(np.clip(values * scale, 0.0, 255.0)).astype(np.uint8)
-        image = Image.fromarray(gray8)
+        if np.issubdtype(original.dtype, np.integer):
+            values /= float(np.iinfo(original.dtype).max)
+        elif values.size and float(np.nanmax(values)) > 1.5:
+            values /= 255.0
+    gray = np.nan_to_num(values, copy=False, nan=0.0, posinf=1.0, neginf=0.0)
+    np.clip(gray, 0.0, 1.0, out=gray)
     max_edge = 1400
-    if max(image.size) > max_edge:
-        ratio = max_edge / max(image.size)
-        image = image.resize(
-            (max(1, int(round(image.width * ratio))), max(1, int(round(image.height * ratio)))),
-            Image.Resampling.BILINEAR,
+    if max(gray.shape) > max_edge:
+        ratio = max_edge / max(gray.shape)
+        small_shape = (
+            max(1, int(round(gray.shape[0] * ratio))),
+            max(1, int(round(gray.shape[1] * ratio))),
         )
-    gray = np.asarray(ImageOps.grayscale(image), dtype=np.float32) / 255.0
+        gray = zoom(
+            gray,
+            (small_shape[0] / gray.shape[0], small_shape[1] / gray.shape[1]),
+            order=1,
+            mode="nearest",
+            prefilter=False,
+        ).astype(np.float32, copy=False)
     height, width = gray.shape
     row_profile = np.median(gray, axis=1)
     smooth_span = max(3, int(round(height * 0.008)) | 1)
@@ -331,12 +336,11 @@ def _sky_detection_mask(
     )
     if horizon_found:
         boundary = max(1, best_row - max(2, int(round(height * 0.006))))
-        softened = np.asarray(
-            ImageOps.grayscale(image).filter(
-                ImageFilter.GaussianBlur(radius=max(2.0, width * 0.012))
-            ),
-            dtype=np.float32,
-        ) / 255.0
+        softened = gaussian_filter(
+            gray,
+            sigma=max(2.0, width * 0.012),
+            mode="nearest",
+        )
         local_sky_level = np.median(softened, axis=1)
         local_floor = np.maximum(local_sky_level * 0.35, 0.008)
         mask_small = (np.arange(height)[:, None] < boundary) & (softened >= local_floor[:, None])
@@ -349,11 +353,18 @@ def _sky_detection_mask(
         mask_small = np.ones(gray.shape, dtype=bool)
 
     target_height, target_width = target_shape
-    mask_image = Image.fromarray((mask_small.astype(np.uint8) * 255), mode="L")
-    mask = np.asarray(
-        mask_image.resize((target_width, target_height), Image.Resampling.NEAREST),
-        dtype=np.uint8,
-    ) == 0
+    mask = zoom(
+        (~mask_small).astype(np.float32),
+        (target_height / height, target_width / width),
+        order=0,
+        mode="nearest",
+        prefilter=False,
+    ) > 0.5
+    mask = mask[:target_height, :target_width]
+    if mask.shape != (target_height, target_width):
+        padded = np.ones((target_height, target_width), dtype=bool)
+        padded[:mask.shape[0], :mask.shape[1]] = mask
+        mask = padded
     sky_fraction = float(np.mean(~mask))
     return mask, {
         "method": "preview horizon profile and low-pass foreground silhouette mask" if horizon_found else "full frame; no reliable horizon transition",
@@ -836,9 +847,8 @@ def _soften_stars(
         min_radius, max_radius = max_radius, min_radius
     opacity_alpha = float(np.clip(opacity, 0.0, 100.0)) / 100.0
     # Weber contrast is the luminance difference divided by background
-    # luminance. Scale the flux-conserving redistribution by the measured sky
-    # level so its visibility stays comparable across differently developed
-    # images.
+    # luminance. Scale peak-matched halo radiance by the measured sky level so
+    # its visibility stays comparable across differently developed images.
     sky_gain = float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50))
     prepared: list[dict[str, object]] = []
 
@@ -959,6 +969,7 @@ def _soften_stars(
     # radius. A square-root response made most stars cluster near max_radius.
     flux_floor = min(float(item["star"].flux) for item in prepared)
     brightest_flux = max(float(item["star"].flux) for item in prepared)
+    reference_peak = max(float(item["source_peak"]) for item in prepared)
     max_log_flux = max(
         math.log(max(brightest_flux, 1e-20) / max(flux_floor, 1e-20)),
         0.0,
@@ -969,17 +980,25 @@ def _soften_stars(
         response = float(np.clip(log_flux / max_log_flux, 0.0, 1.0)) if max_log_flux > 1e-12 else 1.0
         radius = min_radius + (max_radius - min_radius) * response
         diffusion_sigma = (radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 40.0)
-        # Convolution with a normalized Gaussian scattering kernel preserves
-        # the measured radial PSF's integrated light. Its actual profile and
-        # per-radius RGB colour are retained below rather than assuming that
-        # SEP's second moments describe the star core.
+        # Keep the measured radial PSF shape, but use it as a peak-matched
+        # lightening layer. This preserves the observed star core and restores
+        # the visible halo response of the earlier release. The sigma remains
+        # isotropic, so neither brightness nor source ellipticity can stretch
+        # the generated glow into an oval.
         flux_scale = float(np.clip(star.relative_flux_ratio, 0.0, 1.0))
+        color_fraction = np.asarray(item["color_fraction"], dtype=np.float32)
+        color_max = max(float(np.max(color_fraction)), 1e-12)
+        target_peak = (
+            reference_peak
+            * flux_scale
+            * (color_fraction / color_max)
+            * sky_gain
+        )
         source_sigma = max(float(item["source_sigma"]), 1e-6)
         output_sigma = math.sqrt(source_sigma**2 + diffusion_sigma**2)
-        # Optical diffusion convolves with the measured stellar PSF. Gaussian
-        # variances add; the normalized isotropic kernel moves light from the
-        # core into circular wings. The circular feather mask only limits the
-        # finite processing region and does not change the halo's geometry.
+        # Optical diffusion convolves the measured stellar PSF with a normalized
+        # isotropic kernel. The resulting radial shape is peak-matched below;
+        # the circular feather mask only limits the finite processing region.
         item["radius"] = radius
         item["diffusion_sigma"] = diffusion_sigma
         item["sigma"] = output_sigma
@@ -987,6 +1006,7 @@ def _soften_stars(
         item["outer_mask_radius"] = max(float(item["inner_mask_radius"]) + 1.0, 4.0 * output_sigma)
         item["radius_response"] = response
         item["halo_flux_scale"] = flux_scale
+        item["target_peak"] = target_peak
         cx, cy = float(item["cx"]), float(item["cy"])
         center_x, center_y = int(np.clip(round(cx), 0, out_w - 1)), int(np.clip(round(cy), 0, out_h - 1))
         extent = int(math.ceil(float(item["outer_mask_radius"])))
@@ -1028,15 +1048,22 @@ def _soften_stars(
         feather = max(outer_radius - inner_radius, 1e-6)
         mask_t = np.clip((outer_radius - np.sqrt(radial_squared)) / feather, 0.0, 1.0)
         circular_mask = mask_t * mask_t * (3.0 - 2.0 * mask_t)
+        profile_peak = np.max(target_model, axis=(0, 1))
+        target_peak = np.asarray(item["target_peak"], dtype=np.float32)
+        valid_channels = profile_peak > 1e-12
+        channel_scale = np.ones_like(profile_peak, dtype=np.float32)
+        np.divide(target_peak, profile_peak, out=channel_scale, where=valid_channels)
+        target_model *= channel_scale[None, None, :]
         halo_peak = np.max(target_model, axis=(0, 1))
         patch = image_data[y0:y1, x0:x1, :]
-        # Blend the signed difference between measured and convolved radial
-        # profiles. Negative differences reduce the core as light moves
-        # outward; RGB profiles preserve the star's measured color. The mask
-        # keeps the feather circular and leaves its exterior untouched.
-        np.subtract(target_model, source_model, out=target_model)
+        # Lighten only where the peak-matched radial target exceeds the source.
+        # The stellar core therefore remains intact while the RGB wings grow
+        # outward; opacity now controls that visible addition directly.
+        target_model += np.asarray(item["background"], dtype=np.float32)[None, None, :]
+        np.subtract(target_model, patch, out=target_model)
+        np.maximum(target_model, 0.0, out=target_model)
         target_model *= circular_mask[..., None]
-        patch += target_model * (opacity_alpha * sky_gain)
+        patch += target_model * opacity_alpha
         records.append({
             "x_px": round(cx, 2),
             "y_px": round(cy, 2),
@@ -1185,7 +1212,7 @@ def process_raw(
                 np.divide(calibration_float, 65535.0, out=calibration_float)
                 raw_linear_median = _linear_rgb_luminance_median(calibration_float)
                 del calibration_rgb, calibration_float
-            if preview is not None and raw_linear_median is not None:
+            if preview is not None and raw_linear_median is not None and raw_preview_median is not None:
                 raw_preview_ev = _preview_exposure_ev(
                     raw_linear_median, raw_preview_median
                 )
@@ -1201,8 +1228,10 @@ def process_raw(
                     raw_acr_reference_median / raw_linear_median, 0.25, 8.0
                 ))
                 raw_brightness_calibration_method = "same-stem Adobe Camera Raw TIFF median; XMP exposure already reflected in reference"
-            elif preview is not None:
+            elif raw_preview_median is not None:
                 raw_brightness_calibration_method = "embedded preview median combined with XMP Exposure2012 when present"
+            elif preview is not None and raw_xmp_exposure_ev is not None:
+                raw_brightness_calibration_method = "non-sRGB embedded preview left in its original colour space; XMP Exposure2012 only"
             elif raw_xmp_exposure_ev is not None:
                 raw_brightness_calibration_method = "XMP Exposure2012 only; no embedded preview or Adobe TIFF reference"
             report(43, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个符合相对星等范围，正在解码 RAW…")
@@ -1229,7 +1258,7 @@ def process_raw(
         invert_gray = False
         photometric = tifffile.PHOTOMETRIC.RGB
         input_kind = "RAW"
-        encoding = "RAW developed to linear sRGB with XMP/preview or matching Adobe Camera Raw TIFF exposure calibration and highlight preservation; sRGB ICC profile embedded"
+        encoding = "RAW developed to 16-bit sRGB with XMP/sRGB-preview or matching Adobe Camera Raw TIFF exposure calibration and highlight preservation; halo processing uses float32 linear-light values; sRGB ICC profile embedded"
 
     report(63, "图像解码完成，按星点亮度与 PSF 形状柔化…")
     star_measurements = _soften_stars(
@@ -1248,6 +1277,9 @@ def process_raw(
         _linear_to_srgb_inplace(image_data)
     if invert_gray:
         np.subtract(1.0, image_data, out=image_data)
+    # The working buffer remains float32 until this final 16-bit export step.
+    # Clamp all formats here so additive halos cannot wrap uint16 highlights.
+    np.clip(image_data, 0.0, 1.0, out=image_data)
     np.multiply(image_data, 65535.0, out=image_data)
     np.rint(image_data, out=image_data)
     pixels16 = image_data.astype(np.uint16)
@@ -1270,10 +1302,10 @@ def process_raw(
         "relative_magnitude_limit": relative_magnitude_limit,
         "relative_flux_floor_ratio": round(10.0 ** (-0.4 * relative_magnitude_limit), 8),
         "relative_magnitude_difference_definition": "delta_magnitude=-2.5*log10(flux_ratio), relative to the brightest point source in the detected sky area; include candidates where delta_magnitude is at most the selected limit",
-        "soft_focus": "strictly circular isotropic Gaussian diffusion convolved with an RGB stellar radial profile sampled by circular-annulus medians; x and y sigma are equal and SEP ellipticity/angle never shapes the halo; the normalized kernel conserves integrated profile flux; signed source-to-target profile difference is opacity and sky-adaptation blended with a circular smoothstep feather mask",
+        "soft_focus": "strictly circular isotropic Gaussian diffusion convolved with an RGB stellar radial profile sampled by circular-annulus medians; x and y sigma are equal and SEP ellipticity/angle never shapes the halo; the convolved profile is peak-matched to the historical relative-flux and color response, then only positive lightening difference is blended over the source with a circular smoothstep feather mask",
         "halo_geometry": "strictly circular; Euclidean radial bins and equal x/y Gaussian sigma; source ellipticity and position angle are not used to shape the halo",
         "brightness_to_radius_curve": "linear response to relative stellar magnitude: log(aperture_flux/faintest_selected_flux) normalized to brightest selected star, matching 18ffa10 mapping",
-        "brightness_to_halo_strength_curve": "each selected star's measured RGB radial profile is scattered by a normalized Gaussian kernel; SEP aperture flux sets its relative-magnitude radius, so faint stars receive a narrower redistribution",
+        "brightness_to_halo_strength_curve": "each selected star's measured RGB radial profile is scattered by an isotropic Gaussian kernel and peak-matched to the historical relative-flux color response; SEP aperture flux sets both its relative-magnitude radius and halo amplitude, so faint stars receive a narrower and dimmer halo",
         "soft_focus_strength": round(strength, 1),
         "soft_focus_strength_note": "Gaussian scattering-kernel sigma=(radius/3)*sqrt(strength/40); default strength 10, maximum 30; opacity controls the blend amount independently",
         "soft_focus_opacity_percent": round(opacity, 1),
@@ -1281,7 +1313,7 @@ def process_raw(
         "sky_background_level": round(sky_background_level, 7),
         "sky_reference_level": REFERENCE_SKY_LEVEL,
         "sky_adaptation_gain": round(float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)), 4),
-        "sky_adaptation": "SEP global background measured within the detected sky mask; opacity blending of the flux-conserving radial-profile redistribution is scaled in proportion to sky luminance with a 0.70x–1.50x clamp (Weber contrast adaptation)",
+        "sky_adaptation": "SEP global background measured within the detected sky mask; peak-matched halo radiance is scaled in proportion to sky luminance with a 0.70x–1.50x clamp (Weber contrast adaptation)",
         "source_rejection": "sky-region mask; SEP PSF matched detection; reject sources with roundness below 0.35, minor-axis size below 0.35 px, major-axis size above max(6 px, 5x estimated PSF sigma) capped at 12 px, or local RMS above 4x sky-only global RMS except compact sources in dense stellar fields",
         "star_photometry_and_halo_parameters": star_measurements,
         "crowded_stellar_field_sources": sum(star.crowded_field for star in stars),
