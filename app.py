@@ -54,7 +54,7 @@ def _update_job(job_id: str, **values: object) -> None:
             job.update(values)
 
 
-def _run_job(job_id: str, raw_path: Path, output_path: Path, params: dict[str, float]) -> None:
+def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str, float]) -> None:
     def report(percent: int, message: str) -> None:
         _update_job(job_id, percent=10 + int(percent * 0.9), message=message)
 
@@ -72,12 +72,15 @@ def _run_job(job_id: str, raw_path: Path, output_path: Path, params: dict[str, f
                 },
             )
 
-        result = process_raw(raw_path, output_path, **params, progress=report, metadata_callback=metadata)
+        result = process_raw(input_path, output_path, **params, progress=report, metadata_callback=metadata)
         _update_job(job_id, message="正在准备预览…", percent=98)
         with Image.open(output_path) as image:
             image.thumbnail((1600, 1100), Image.Resampling.LANCZOS)
             buffer = io.BytesIO()
-            image.convert("RGB").save(buffer, format="JPEG", quality=91, optimize=True)
+            preview_options = {"format": "JPEG", "quality": 91, "optimize": True}
+            if image.mode in {"RGB", "RGBA"} and image.info.get("icc_profile"):
+                preview_options["icc_profile"] = image.info["icc_profile"]
+            image.convert("RGB").save(buffer, **preview_options)
             preview = buffer.getvalue()
         _update_job(
             job_id,
@@ -86,10 +89,12 @@ def _run_job(job_id: str, raw_path: Path, output_path: Path, params: dict[str, f
             message="柔焦完成",
             stars=result.star_count,
             candidates=result.candidate_count,
-            eligible=result.eligible_count,
-            relativeBrightnessFloor=result.relative_brightness_floor,
+            selectedCount=result.selected_count,
+            requestedStarCount=result.star_count_limit,
             width=result.width,
             height=result.height,
+            inputKind=result.input_kind,
+            colorProfile=result.color_profile,
             outputName=Path(result.output_path).name,
             preview=preview,
         )
@@ -97,7 +102,7 @@ def _run_job(job_id: str, raw_path: Path, output_path: Path, params: dict[str, f
         _update_job(job_id, state="error", message=str(exc), percent=0)
     finally:
         try:
-            raw_path.unlink(missing_ok=True)
+            input_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -106,7 +111,7 @@ def _make_handler(token: str):
     base = f"/{token}"
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "StarSoftFocus/1.2"
+        server_version = "StarSoftFocus/1.3"
         sys_version = ""
 
         def log_message(self, _format: str, *_args: object) -> None:
@@ -213,37 +218,45 @@ def _make_handler(token: str):
                 self._json(400, {"error": "上传长度无效"})
                 return
             if content_length <= 0 or content_length > MAX_UPLOAD:
-                self._json(413, {"error": "RAW 文件为空或超过 1.5 GB 限制"})
+                self._json(413, {"error": "输入文件为空或超过 1.5 GB 限制"})
                 return
 
+            name = _safe_filename(unquote(self.headers.get("X-File-Name", "night_sky.raw")))
+            supported_extensions = {
+                ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".sr2", ".srf", ".dng",
+                ".orf", ".rw2", ".raf", ".pef", ".ptx", ".3fr", ".fff", ".iiq", ".kdc",
+                ".dcr", ".mos", ".mrw", ".x3f", ".tif", ".tiff", ".jpg", ".jpeg",
+            }
+            if Path(name).suffix.lower() not in supported_extensions:
+                self._json(415, {"error": "请选择相机 RAW、TIFF 或 JPG 文件。"})
+                return
             query = parse_qs(urlsplit(self.path).query)
             try:
                 params = {
                     "sensitivity": float(query.get("sensitivity", ["4.8"])[0]),
                     "strength": float(query.get("strength", ["10"])[0]),
-                    "relative_brightness_floor": float(query.get("relative_brightness_floor", ["0.063"])[0]),
+                    "star_count_limit": int(float(query.get("star_count_limit", ["200"])[0])),
                     "min_radius": float(query.get("min_radius", ["3"])[0]),
-                    "max_radius": float(query.get("max_radius", ["34"])[0]),
+                    "max_radius": float(query.get("max_radius", ["42"])[0]),
                 }
             except ValueError:
                 self._json(400, {"error": "柔焦参数无效"})
                 return
             params["sensitivity"] = min(max(params["sensitivity"], 2.0), 10.0)
             params["strength"] = min(max(params["strength"], 0.0), 30.0)
-            params["relative_brightness_floor"] = min(max(params["relative_brightness_floor"], 0.0), 1.0)
+            params["star_count_limit"] = min(max(params["star_count_limit"], 0), 500)
             params["min_radius"] = min(max(params["min_radius"], 2.0), 24.0)
             params["max_radius"] = min(max(params["max_radius"], 8.0), 80.0)
             if params["max_radius"] < params["min_radius"]:
                 params["min_radius"], params["max_radius"] = params["max_radius"], params["min_radius"]
 
-            name = _safe_filename(unquote(self.headers.get("X-File-Name", "night_sky.raw")))
             temp_dir = tempfile.mkdtemp(prefix="starsoft_")
             TEMP_DIRS.append(temp_dir)
-            raw_path = Path(temp_dir) / name
+            input_path = Path(temp_dir) / name
             output_path = Path(temp_dir) / f"{Path(name).stem}_星点柔焦.tif"
             remaining = content_length
             try:
-                with raw_path.open("wb") as handle:
+                with input_path.open("wb") as handle:
                     while remaining:
                         chunk = self.rfile.read(min(1024 * 1024, remaining))
                         if not chunk:
@@ -267,7 +280,7 @@ def _make_handler(token: str):
                     "outputPath": str(output_path),
                     "tempDir": temp_dir,
                 }
-            worker = threading.Thread(target=_run_job, args=(job_id, raw_path, output_path, params), daemon=True)
+            worker = threading.Thread(target=_run_job, args=(job_id, input_path, output_path, params), daemon=True)
             worker.start()
             self._json(202, {"id": job_id})
 
