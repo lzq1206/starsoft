@@ -71,7 +71,7 @@ class ProcessResult:
     star_count: int
     candidate_count: int
     selected_count: int
-    relative_brightness_floor: float
+    relative_magnitude_limit: float
     width: int
     height: int
     camera: str
@@ -640,15 +640,16 @@ def _read_raster(path: Path) -> RasterInput:
 def detect_stars(
     detector: np.ndarray,
     sensitivity: float,
-    relative_brightness_floor: float = 0.063,
+    relative_magnitude_limit: float = 3.0,
     detection_mask: np.ndarray | None = None,
 ) -> tuple[list[Star], int, int, float]:
-    """Return SEP point sources above a relative aperture-flux threshold."""
+    """Return SEP point sources within a relative aperture-magnitude range."""
     data = np.ascontiguousarray(detector, dtype=np.float32)
     mask = np.ascontiguousarray(detection_mask, dtype=bool) if detection_mask is not None else None
     if mask is not None and mask.shape != data.shape:
         raise ValueError("星空遮罩尺寸与星点检测图像不一致。")
-    relative_brightness_floor = float(np.clip(relative_brightness_floor, 0.001, 1.0))
+    relative_magnitude_limit = float(np.clip(relative_magnitude_limit, 0.0, 10.0))
+    relative_flux_floor = 10.0 ** (-0.4 * relative_magnitude_limit)
     background = sep.Background(data, mask=mask, bw=64, bh=64, fw=3, fh=3)
     global_sky = float(np.clip(background.globalback, 0.0, 1.0))
     signal = np.ascontiguousarray(data - background.back(), dtype=np.float32)
@@ -674,9 +675,9 @@ def detect_stars(
     global_rms = max(float(background.globalrms), 1e-12)
     first_good = (
         ((first_pass["flag"] & (sep.OBJ_TRUNC | sep.OBJ_SINGU)) == 0)
-        & (first_roundness >= 0.68)
+        & (first_roundness >= 0.45)
         & (first_size >= 0.45)
-        & (first_size <= 4.5)
+        & (first_size <= 6.0)
         & (first_pass["flux"] > 0)
     )
     if np.any(first_good):
@@ -744,9 +745,9 @@ def detect_stars(
         & np.isfinite(objects["flux"])
         & np.isfinite(moment_size)
         & (objects["flux"] > 0)
-        & (minor >= 0.45)
-        & (major <= min(6.0, max(3.5, 2.25 * psf_sigma)))
-        & (roundness >= 0.68)
+        & (minor >= 0.35)
+        & (major <= min(12.0, max(6.0, 5.0 * psf_sigma)))
+        & (roundness >= 0.35)
         & (~elevated_local_noise | crowded_stellar_field)
         & ~bad_flags
     )
@@ -784,7 +785,7 @@ def detect_stars(
     candidate_count = int(len(indices))
     brightest_flux = float(np.max(flux))
     relative_flux = flux / max(brightest_flux, 1e-20)
-    eligible = relative_flux >= relative_brightness_floor
+    eligible = relative_flux >= relative_flux_floor
     eligible_indices = np.flatnonzero(eligible)
     selected_count = int(len(eligible_indices))
     if selected_count == 0:
@@ -1013,7 +1014,7 @@ def process_raw(
     sensitivity: float = 4.8,
     strength: float = 10.0,
     opacity: float = 30.0,
-    relative_brightness_floor: float = 0.063,
+    relative_magnitude_limit: float = 3.0,
     min_radius: float = 3.0,
     max_radius: float = 42.0,
     progress: Progress | None = None,
@@ -1027,7 +1028,7 @@ def process_raw(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if max_radius < min_radius:
         min_radius, max_radius = max_radius, min_radius
-    relative_brightness_floor = float(np.clip(relative_brightness_floor, 0.001, 1.0))
+    relative_magnitude_limit = float(np.clip(relative_magnitude_limit, 0.0, 10.0))
     strength = float(np.clip(strength, 0.0, 30.0))
     opacity = float(np.clip(opacity, 0.0, 100.0))
 
@@ -1054,7 +1055,7 @@ def process_raw(
         sky_mask, sky_mask_info = _sky_detection_mask(raster.pixels, detector.shape)
         report(12, "正在识别星点与测量亮度…")
         stars, candidate_count, selected_count, sky_background_level = detect_stars(
-            detector, sensitivity, relative_brightness_floor, sky_mask
+            detector, sensitivity, relative_magnitude_limit, sky_mask
         )
         image_data = raster.pixels
         profile = raster.profile
@@ -1073,7 +1074,7 @@ def process_raw(
             if raster.linear_srgb
             else "native source channel encoding retained; original ICC profile bytes preserved"
         )
-        report(36, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个达到相对亮度门限，开始柔焦…")
+        report(36, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个符合相对星等范围，开始柔焦…")
     else:
         raw_extensions = {
             ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".sr2", ".srf", ".dng",
@@ -1094,7 +1095,7 @@ def process_raw(
             )
             report(12, "正在识别星点与测量亮度…")
             stars, candidate_count, selected_count, sky_background_level = detect_stars(
-                detector, sensitivity, relative_brightness_floor, sky_mask
+                detector, sensitivity, relative_magnitude_limit, sky_mask
             )
             raw_acr_reference_median, raw_acr_reference_name = _acr_reference_luminance_median(input_path)
             if preview is not None:
@@ -1136,7 +1137,7 @@ def process_raw(
                 raw_brightness_calibration_method = "embedded preview median combined with XMP Exposure2012 when present"
             elif raw_xmp_exposure_ev is not None:
                 raw_brightness_calibration_method = "XMP Exposure2012 only; no embedded preview or Adobe TIFF reference"
-            report(43, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个达到亮度门限，正在解码 RAW…")
+            report(43, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个符合相对星等范围，正在解码 RAW…")
             rgb = raw.postprocess(
                 gamma=(1, 1),
                 no_auto_bright=True,
@@ -1197,9 +1198,10 @@ def process_raw(
         "detected_stars": len(stars),
         "point_source_candidates": candidate_count,
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
-        "star_selection": "all SEP point sources above the selected relative aperture-flux ratio; instrumental brightness, not catalog apparent magnitude",
-        "relative_brightness_floor_flux_ratio": relative_brightness_floor,
-        "relative_magnitude_difference_definition": "delta_magnitude=-2.5*log10(flux_ratio), relative to the brightest point source in the detected sky area",
+        "star_selection": "all SEP point sources within the selected relative aperture-magnitude range; instrumental photometry, not catalog apparent magnitude",
+        "relative_magnitude_limit": relative_magnitude_limit,
+        "relative_flux_floor_ratio": round(10.0 ** (-0.4 * relative_magnitude_limit), 8),
+        "relative_magnitude_difference_definition": "delta_magnitude=-2.5*log10(flux_ratio), relative to the brightest point source in the detected sky area; include candidates where delta_magnitude is at most the selected limit",
         "soft_focus": "circular isotropic Gaussian wings with circular smoothstep feather mask; only the positive difference from the target halo profile is blended, leaving pixels outside the circular mask unchanged",
         "brightness_to_radius_curve": "linear response to relative stellar magnitude: log(aperture_flux/faintest_selected_flux) normalized to brightest selected star, matching 18ffa10 mapping",
         "brightness_to_halo_strength_curve": "halo peak scales linearly with SEP aperture-flux ratio to the brightest selected star; faint stars receive smaller halos as well as smaller radii",
@@ -1211,7 +1213,7 @@ def process_raw(
         "sky_reference_level": REFERENCE_SKY_LEVEL,
         "sky_adaptation_gain": round(float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)), 4),
         "sky_adaptation": "SEP global background; halo wing amplitude scaled in proportion to background luminance with a 0.70x–1.50x clamp (Weber contrast adaptation)",
-        "source_rejection": "sky-region mask; SEP PSF matched detection; reject sources with nonstellar roundness, excessive size relative to estimated PSF, or local RMS above 4x sky-only global RMS except compact sources in dense stellar fields",
+        "source_rejection": "sky-region mask; SEP PSF matched detection; reject sources with roundness below 0.35, minor-axis size below 0.35 px, major-axis size above max(6 px, 5x estimated PSF sigma) capped at 12 px, or local RMS above 4x sky-only global RMS except compact sources in dense stellar fields",
         "star_photometry_and_halo_parameters": star_measurements,
         "crowded_stellar_field_sources": sum(star.crowded_field for star in stars),
         "crowded_stellar_field_rule": "allow compact, round PSF detections above the local RMS threshold only when at least four compact detections lie within max(16 detector pixels, 6 x estimated PSF sigma); extended diffuse structure remains rejected",
@@ -1256,7 +1258,7 @@ def process_raw(
         star_count=len(stars),
         candidate_count=candidate_count,
         selected_count=selected_count,
-        relative_brightness_floor=relative_brightness_floor,
+        relative_magnitude_limit=relative_magnitude_limit,
         width=int(pixels16.shape[1]),
         height=int(pixels16.shape[0]),
         camera=info.camera,

@@ -48,13 +48,13 @@
             <input id="strength" class="range" type="range" min="0" max="30" step="1" value="10">
             <div class="group"><label for="opacity">光晕不透明度</label><span id="opacityValue" class="value"></span></div>
             <input id="opacity" class="range" type="range" min="0" max="100" step="1" value="30">
-            <div class="group"><label for="relativeBrightness">星点相对亮度下限</label><span id="relativeBrightnessValue" class="value"></span></div>
-            <input id="relativeBrightness" class="range" type="range" min="0.1" max="100" step="0.1" value="6.3">
+            <div class="group"><label for="relativeMagnitudeLimit">柔焦星点亮度范围控制</label><span id="relativeMagnitudeLimitValue" class="value"></span></div>
+            <input id="relativeMagnitudeLimit" class="range" type="range" min="0" max="10" step="0.1" value="3.0">
             <div class="group"><label for="minRadius">最小柔焦半径</label><span id="minValue" class="value"></span></div>
             <input id="minRadius" class="range" type="range" min="2" max="24" step="1" value="3">
             <div class="group"><label for="maxRadius">最大柔焦半径</label><span id="maxValue" class="value"></span></div>
             <input id="maxRadius" class="range" type="range" min="8" max="80" step="1" value="42">
-            <p class="hint">按星空区域内 SEP 圆孔径通量相对最亮点源的比例筛选，默认 6.3%（约相当于比最亮点暗 3 等），达标点源全部处理，不设数量上限。该值是画面内相对通量，不是星表绝对星等；绝对星等需要天文解算后匹配 Gaia 星表。强度默认 10、最高 30，控制扩散宽度；光晕不透明度默认 30%，数值越高光晕越明显。亮度同时决定光晕半径与强度。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。星色取自原图 RGB 孔径测光。</p>
+            <p class="hint">此项设置相对于天空区域最亮点源的相对星等差上限，默认 3.0 等。数值越大，纳入的较暗点源越多，达标点源全部处理且不设数量上限。亮度来自 SEP 圆孔径测光，属于画面内相对值，不是星表绝对星等。强度默认 10、最高 30，控制扩散宽度；光晕不透明度默认 30%，数值越高光晕越明显。亮度同时决定光晕半径与强度。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。星色取自原图 RGB 孔径测光。</p>
           </div>
         </div>
         <div class="export-wrap">
@@ -91,7 +91,7 @@
     slider("sensitivity","sensitivityValue",v=>`${v.toFixed(1)} σ`);
     slider("strength","strengthValue",v=>`${Math.round(v)} / 30`);
     slider("opacity","opacityValue",v=>`${Math.round(v)}%`);
-    slider("relativeBrightness","relativeBrightnessValue",v=>`${v.toFixed(1)}%`);
+    slider("relativeMagnitudeLimit","relativeMagnitudeLimitValue",v=>`Δm ≤ ${v.toFixed(1)} 等`);
     slider("minRadius","minValue",v=>`${v.toFixed(0)} px`);
     slider("maxRadius","maxValue",v=>`${v.toFixed(0)} px`);
     function chooseFile(file){if(!file)return;selectedFile=file;$("fileMeta").classList.add("show");$("fileName").textContent=file.name;$("fileSize").textContent=formatBytes(file.size);$("lensMeta").textContent="处理时读取图像与可用的镜头信息";start.disabled=busy;$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="文件已就绪，可以开始处理";setStatus("图像文件已就绪 · 可调整星点识别与柔焦范围",0);}
@@ -101,13 +101,13 @@
     drop.addEventListener("drop",e=>chooseFile(e.dataTransfer.files[0]));
     async function pollJob(id){try{const response=await fetch(`${BASE}/api/jobs/${encodeURIComponent(id)}`);const job=await response.json();if(!response.ok)throw new Error(job.error||"任务状态读取失败");if(job.metadata){const m=job.metadata;const bits=[m.lens||"未记录镜头"];if(m.focalLength)bits.push(`${m.focalLength} mm`);if(m.aperture)bits.push(`f/${m.aperture}`);$("lensMeta").textContent=`${m.width.toLocaleString()} × ${m.height.toLocaleString()} px · ${bits.join(" · ")}`;}
       setStatus(job.message||"正在处理…",job.percent||0);
-      if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent=`亮度门限 ${job.relativeBrightnessFloor.toFixed(1)}% · 柔焦 ${job.stars.toLocaleString()} / ${job.candidates.toLocaleString()} 个天空点源 · ${job.width.toLocaleString()} × ${job.height.toLocaleString()} · 天光 ${(job.skyBackgroundLevel*100).toFixed(2)}% · 光晕适配 ${job.skyAdaptationGain.toFixed(2)}× · ${job.outputName}`;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
+      if(job.state==="complete"){$("preview").src=`${BASE}/api/jobs/${encodeURIComponent(id)}/preview?v=${Date.now()}`;$("preview").style.display="block";$("placeholder").style.display="none";$("previewLabel").textContent="16 位 TIFF 柔焦结果";$("resultMeta").textContent=`相对星等差上限 Δm≤${job.relativeMagnitudeLimit.toFixed(1)} · 柔焦 ${job.stars.toLocaleString()} / ${job.candidates.toLocaleString()} 个天空点源 · ${job.width.toLocaleString()} × ${job.height.toLocaleString()} · 天光 ${(job.skyBackgroundLevel*100).toFixed(2)}% · 光晕适配 ${job.skyAdaptationGain.toFixed(2)}× · ${job.outputName}`;$("download").href=`${BASE}/api/jobs/${encodeURIComponent(id)}/download`;
         $("result").classList.add("show");busy=false;start.disabled=false;start.textContent="✦  更改参数后再次处理";setStatus("柔焦完成",100);return;}
       if(job.state==="error")throw new Error(job.message||"处理失败");
       setTimeout(()=>pollJob(id),650);
     }catch(error){busy=false;start.disabled=!selectedFile;start.textContent="✦  开始星点柔焦";setStatus(error.message,0);$("status").classList.add("error");}}
     start.addEventListener("click",async()=>{if(!selectedFile||busy)return;busy=true;start.disabled=true;start.textContent="正在处理…";$("status").classList.remove("error");$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="正在识别星点";$("previewLabel").textContent="本机处理进行中";setStatus("正在上传图像到本机处理进程…",2);
-      const params=new URLSearchParams({sensitivity:$("sensitivity").value,strength:$("strength").value,opacity:$("opacity").value,relative_brightness_floor:(Number($("relativeBrightness").value)/100).toString(),min_radius:$("minRadius").value,max_radius:$("maxRadius").value});
+      const params=new URLSearchParams({sensitivity:$("sensitivity").value,strength:$("strength").value,opacity:$("opacity").value,relative_magnitude_limit:$("relativeMagnitudeLimit").value,min_radius:$("minRadius").value,max_radius:$("maxRadius").value});
       try{const body=await new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("POST",`${BASE}/api/jobs?${params}`);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.setRequestHeader("X-File-Name",encodeURIComponent(selectedFile.name));xhr.upload.onprogress=e=>{if(e.lengthComputable)setStatus(`正在上传图像… ${formatBytes(e.loaded)} / ${formatBytes(e.total)}`,Math.round(2+8*e.loaded/e.total));};xhr.onload=()=>{let data={};try{data=JSON.parse(xhr.responseText);}catch(_){}if(xhr.status<200||xhr.status>=300)reject(new Error(data.error||"无法开始处理"));else resolve(data);};xhr.onerror=()=>reject(new Error("与本机处理进程的连接中断"));xhr.send(selectedFile);});currentJob=body.id;setStatus("文件已接收，正在识别星点…",10);pollJob(currentJob);}catch(error){busy=false;start.disabled=false;start.textContent="✦  开始星点柔焦";$("status").classList.add("error");setStatus(error.message,0);}});
     $("exit").addEventListener("click",async()=>{if(busy&&!confirm("处理正在进行。退出会中断本次处理，确定退出吗？"))return;$("exit").textContent="正在退出…";try{await fetch(`${BASE}/api/shutdown`,{method:"POST"});}catch(_){}document.body.innerHTML='<main style="font:14px Microsoft YaHei UI, sans-serif;color:#eee;background:#0e1017;height:100vh;display:grid;place-items:center;text-align:center"><div><div style="font-size:34px;color:#c7a9ff">✦</div><b>星点柔焦已关闭</b><p style="color:#9da4b8">可以关闭此浏览器页面。</p></div></main>';});
   </script>
