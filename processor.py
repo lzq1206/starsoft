@@ -16,8 +16,11 @@ import sep
 import tifffile
 from PIL import ExifTags, Image, ImageCms, ImageOps
 
+from version import APP_VERSION
+
 
 Progress = Callable[[int, str], None]
+REFERENCE_SKY_LEVEL = 0.05134
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class Star:
     a: float = 1.0
     b: float = 1.0
     theta: float = 0.0
+    signal_to_noise: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,8 @@ class ProcessResult:
     lens: str
     input_kind: str
     color_profile: str
+    sky_background_level: float
+    sky_adaptation_gain: float
 
 
 @dataclass(frozen=True)
@@ -387,10 +393,11 @@ def detect_stars(
     detector: np.ndarray,
     sensitivity: float,
     star_count_limit: int = 200,
-) -> tuple[list[Star], int, int]:
+) -> tuple[list[Star], int, int, float]:
     """Return the requested number of brightest SEP point sources."""
     data = np.ascontiguousarray(detector, dtype=np.float32)
     background = sep.Background(data, bw=64, bh=64, fw=3, fh=3)
+    global_sky = float(np.clip(background.globalback, 0.0, 1.0))
     signal = np.ascontiguousarray(data - background.back(), dtype=np.float32)
     noise = np.ascontiguousarray(background.rms(), dtype=np.float32)
     first_pass = _extract_sources(
@@ -403,17 +410,19 @@ def detect_stars(
         clean=True,
     )
     if len(first_pass) == 0:
-        return [], 0, 0
+        return [], 0, 0, global_sky
 
     first_major = np.maximum(first_pass["a"], first_pass["b"])
     first_minor = np.minimum(first_pass["a"], first_pass["b"])
     first_size = np.sqrt(np.maximum(first_pass["a"] * first_pass["b"], 0.0))
     first_roundness = first_minor / np.maximum(first_major, 1e-8)
+    first_noise = background.rms()
+    global_rms = max(float(background.globalrms), 1e-12)
     first_good = (
         (first_pass["flag"] == 0)
-        & (first_roundness >= 0.5)
+        & (first_roundness >= 0.68)
         & (first_size >= 0.45)
-        & (first_size <= 6.0)
+        & (first_size <= 4.5)
         & (first_pass["flux"] > 0)
     )
     if np.any(first_good):
@@ -445,13 +454,19 @@ def detect_stars(
         segmentation_map=False,
     )
     if len(objects) == 0:
-        return [], 0, 0
+        return [], 0, 0, global_sky
 
     major = np.maximum(objects["a"], objects["b"])
     minor = np.minimum(objects["a"], objects["b"])
     moment_size = np.sqrt(np.maximum(objects["a"] * objects["b"], 0.0))
     roundness = minor / np.maximum(major, 1e-8)
     bad_flags = (objects["flag"] & (sep.OBJ_TRUNC | sep.OBJ_SINGU)) != 0
+    object_x = np.clip(np.rint(objects["x"]).astype(np.int64), 0, data.shape[1] - 1)
+    object_y = np.clip(np.rint(objects["y"]).astype(np.int64), 0, data.shape[0] - 1)
+    local_noise = np.asarray([
+        np.median(first_noise[max(0, y - 4):min(data.shape[0], y + 5), max(0, x - 4):min(data.shape[1], x + 5)])
+        for x, y in zip(object_x, object_y)
+    ], dtype=np.float32)
     point_source = (
         np.isfinite(objects["x"])
         & np.isfinite(objects["y"])
@@ -459,19 +474,20 @@ def detect_stars(
         & np.isfinite(moment_size)
         & (objects["flux"] > 0)
         & (minor >= 0.45)
-        & (major <= 12.0)
-        & (roundness >= 0.35)
+        & (major <= min(6.0, max(3.5, 2.25 * psf_sigma)))
+        & (roundness >= 0.68)
+        & (local_noise <= 4.0 * global_rms)
         & ~bad_flags
     )
     indices = np.flatnonzero(point_source)
     if len(indices) == 0:
-        return [], 0, 0
+        return [], 0, 0, global_sky
 
     # SEP's isophotal flux is useful for extraction. Circular aperture flux is
     # measured separately so the brightness ordering includes more of each PSF.
     fwhm = 2.354820045 * moment_size[indices]
     aperture_radius = np.clip(1.25 * fwhm, 2.5, 12.0)
-    flux, _flux_error, aperture_flags = sep.sum_circle(
+    flux, flux_error, aperture_flags = sep.sum_circle(
         signal,
         objects["x"][indices],
         objects["y"][indices],
@@ -479,15 +495,24 @@ def detect_stars(
         err=noise,
         subpix=5,
     )
-    good = np.isfinite(flux) & (flux > 0) & ((aperture_flags & sep.APER_TRUNC) == 0)
+    good = (
+        np.isfinite(flux)
+        & (flux > 0)
+        & np.isfinite(flux_error)
+        & (flux_error > 0)
+        & ((aperture_flags & sep.APER_TRUNC) == 0)
+    )
     indices = indices[good]
     flux = flux[good]
+    flux_error = flux_error[good]
+    local_noise = local_noise[indices]
     if len(indices) == 0:
-        return [], 0, 0
+        return [], 0, 0, global_sky
 
     candidate_count = int(len(indices))
     brightest_flux = float(np.max(flux))
     relative_flux = flux / max(brightest_flux, 1e-20)
+    signal_to_noise = flux / np.maximum(flux_error, 1e-20)
     order = np.argsort(flux)[::-1][: int(np.clip(star_count_limit, 0, 500))]
     stars = [
         Star(
@@ -500,10 +525,11 @@ def detect_stars(
             float(objects["a"][indices[i]]),
             float(objects["b"][indices[i]]),
             float(objects["theta"][indices[i]]),
+            float(signal_to_noise[i]),
         )
         for i in order
     ]
-    return stars, candidate_count, len(stars)
+    return stars, candidate_count, len(stars), global_sky
 
 
 def _soften_stars(
@@ -513,6 +539,8 @@ def _soften_stars(
     min_radius: float,
     max_radius: float,
     strength: float,
+    opacity: float,
+    sky_background_level: float,
     progress: Progress | None = None,
 ) -> list[dict[str, object]]:
     if not stars or strength <= 0:
@@ -524,6 +552,11 @@ def _soften_stars(
     scale_y = out_h / det_h
     if max_radius < min_radius:
         min_radius, max_radius = max_radius, min_radius
+    opacity_alpha = float(np.clip(opacity, 0.0, 100.0)) / 100.0
+    # Weber contrast is the luminance difference divided by background
+    # luminance. Scale the added wings in proportion to the measured sky level
+    # so the halo keeps a similar relationship to the sky across exposures.
+    sky_gain = float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50))
     prepared: list[dict[str, object]] = []
 
     # Capture each source profile before adding any halos. SEP's second moments
@@ -533,22 +566,14 @@ def _soften_stars(
         cy = (star.y + 0.5) * scale_y - 0.5
         center_x = int(np.clip(round(cx), 0, out_w - 1))
         center_y = int(np.clip(round(cy), 0, out_h - 1))
-        q = float(np.clip(star.relative_flux_ratio, 0.0, 1.0))
-        # A square-root response gives bright stars more range while avoiding
-        # the excessive radius jump of a linear mapping over a wide flux range.
-        radius = float(min_radius + (max_radius - min_radius) * math.sqrt(q))
-        diffusion_sigma = (radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 10.0)
         a = max(float(star.a) * scale_x, 0.45)
         b = max(float(star.b) * scale_y, 0.45)
-        theta = float(star.theta)
-        cos_t, sin_t = math.cos(theta), math.sin(theta)
-        cov_xx = a * a * cos_t * cos_t + b * b * sin_t * sin_t
-        cov_yy = a * a * sin_t * sin_t + b * b * cos_t * cos_t
-        cov_xy = (a * a - b * b) * sin_t * cos_t
-        cov_xx += diffusion_sigma * diffusion_sigma
-        cov_yy += diffusion_sigma * diffusion_sigma
-        max_variance = 0.5 * (cov_xx + cov_yy + math.sqrt((cov_xx - cov_yy) ** 2 + 4.0 * cov_xy**2))
-        extent = max(3, int(math.ceil(3.75 * math.sqrt(max_variance))))
+        # SEP shape moments size the local measurement patch; the generated
+        # scattering wing itself is always a circular, separate Gaussian.
+        source_sigma = math.sqrt((a * a + b * b) * 0.5)
+        widest_diffusion_sigma = (max_radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 40.0)
+        probe_sigma = math.sqrt(source_sigma * source_sigma + widest_diffusion_sigma * widest_diffusion_sigma)
+        extent = max(8, int(math.ceil(4.0 * probe_sigma)))
         x0, x1 = max(0, center_x - extent), min(out_w, center_x + extent + 1)
         y0, y1 = max(0, center_y - extent), min(out_h, center_y + extent + 1)
         source_patch = image_data[y0:y1, x0:x1, :]
@@ -562,7 +587,29 @@ def _soften_stars(
             max(0, center_x - 2) : min(out_w, center_x + 3),
             :,
         ]
-        amplitude = np.maximum(np.max(core, axis=(0, 1)) - local_background, 0.0)
+        core_signal = np.maximum(np.max(core, axis=(0, 1)) - local_background, 0.0)
+        aperture_radius = float(np.clip(star.fwhm * (scale_x + scale_y) * 0.625, 2.5, 24.0))
+        aperture_extent = int(math.ceil(aperture_radius))
+        ax0, ax1 = max(0, center_x - aperture_extent), min(out_w, center_x + aperture_extent + 1)
+        ay0, ay1 = max(0, center_y - aperture_extent), min(out_h, center_y + aperture_extent + 1)
+        ay, ax = np.ogrid[ay0:ay1, ax0:ax1]
+        aperture_mask = (ax - cx) ** 2 + (ay - cy) ** 2 <= aperture_radius * aperture_radius
+        aperture_signal = np.maximum(image_data[ay0:ay1, ax0:ax1, :] - local_background[None, None, :], 0.0)
+        color_flux = np.sum(aperture_signal * aperture_mask[..., None], axis=(0, 1))
+        if float(np.sum(color_flux)) <= 1e-12:
+            color_flux = core_signal.copy()
+        if float(np.sum(core_signal)) > 1e-12:
+            core_color = core_signal / float(np.sum(core_signal))
+        else:
+            core_color = color_flux / max(float(np.sum(color_flux)), 1e-12)
+        aperture_color = color_flux / max(float(np.sum(color_flux)), 1e-12)
+        # Use aperture photometry for chroma while retaining some core color in
+        # saturated or locally crowded stellar profiles.
+        color_fraction = 0.7 * aperture_color + 0.3 * core_color
+        color_fraction /= max(float(np.sum(color_fraction)), 1e-12)
+        color_max = max(float(np.max(color_fraction)), 1e-12)
+        source_peak = float(np.max(core_signal))
+        amplitude = source_peak * (color_fraction / color_max) * sky_gain
         prepared.append({
             "star": star,
             "cx": cx,
@@ -571,47 +618,89 @@ def _soften_stars(
             "x1": x1,
             "y0": y0,
             "y1": y1,
-            "cov_xx": cov_xx,
-            "cov_yy": cov_yy,
-            "cov_xy": cov_xy,
+            "sigma": probe_sigma,
+            "inner_mask_radius": 3.0 * probe_sigma,
+            "outer_mask_radius": 4.0 * probe_sigma,
             "background": local_background,
             "amplitude": amplitude,
-            "radius": radius,
+            "color_fraction": color_fraction,
         })
+
+    # For a Gaussian profile I(r)=I0*exp(-r²/(2σ²)), a fixed isophote has
+    # radius proportional to sqrt(log(I0/I_threshold)). Use the faintest
+    # selected aperture flux as that threshold; the mapping is strictly
+    # monotonic in measured SEP brightness and gives the faintest star min_radius.
+    flux_floor = min(float(item["star"].flux) for item in prepared)
+    max_log_flux = max(
+        (math.log(max(float(item["star"].flux), 1e-20) / max(flux_floor, 1e-20)) for item in prepared),
+        default=0.0,
+    )
+    max_log_flux = max(max_log_flux, 0.0)
+    for item in prepared:
+        log_flux = max(math.log(max(float(item["star"].flux), 1e-20) / max(flux_floor, 1e-20)), 0.0)
+        response = math.sqrt(log_flux / max_log_flux) if max_log_flux > 1e-12 else 1.0
+        radius = min_radius + (max_radius - min_radius) * response
+        diffusion_sigma = (radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 40.0)
+        star = item["star"]
+        # The added scattering wing has its own circular Gaussian width. The
+        # original, possibly imperfect stellar core remains unmodified below.
+        output_sigma = diffusion_sigma
+        item["radius"] = radius
+        item["diffusion_sigma"] = diffusion_sigma
+        item["sigma"] = output_sigma
+        item["inner_mask_radius"] = max(1.0, 3.0 * output_sigma)
+        item["outer_mask_radius"] = max(float(item["inner_mask_radius"]) + 1.0, 4.0 * output_sigma)
+        item["isophote_radius_response"] = response
+        cx, cy = float(item["cx"]), float(item["cy"])
+        center_x, center_y = int(np.clip(round(cx), 0, out_w - 1)), int(np.clip(round(cy), 0, out_h - 1))
+        extent = int(math.ceil(float(item["outer_mask_radius"])))
+        item["x0"], item["x1"] = max(0, center_x - extent), min(out_w, center_x + extent + 1)
+        item["y0"], item["y1"] = max(0, center_y - extent), min(out_h, center_y + extent + 1)
 
     for index, item in enumerate(prepared):
         star = item["star"]
         cx, cy = float(item["cx"]), float(item["cy"])
         x0, x1 = int(item["x0"]), int(item["x1"])
         y0, y1 = int(item["y0"]), int(item["y1"])
-        cov_xx, cov_yy = float(item["cov_xx"]), float(item["cov_yy"])
-        cov_xy = float(item["cov_xy"])
-        determinant = max(cov_xx * cov_yy - cov_xy * cov_xy, 1e-12)
-        inv_xx, inv_yy, inv_xy = cov_yy / determinant, cov_xx / determinant, -cov_xy / determinant
         yy, xx = np.ogrid[y0:y1, x0:x1]
         dx, dy = xx - cx, yy - cy
-        mahalanobis = inv_xx * dx * dx + inv_yy * dy * dy + 2.0 * inv_xy * dx * dy
-        gaussian = np.exp(-0.5 * mahalanobis).astype(np.float32)
+        radial_squared = dx * dx + dy * dy
+        sigma = float(item["sigma"])
+        gaussian = np.exp(-0.5 * radial_squared / max(sigma * sigma, 1e-12)).astype(np.float32)
+        inner_radius = float(item["inner_mask_radius"])
+        outer_radius = float(item["outer_mask_radius"])
+        feather = max(outer_radius - inner_radius, 1e-6)
+        mask_t = np.clip((outer_radius - np.sqrt(radial_squared)) / feather, 0.0, 1.0)
+        circular_mask = mask_t * mask_t * (3.0 - 2.0 * mask_t)
         halo_peak = np.asarray(item["amplitude"])
-        halo = np.asarray(item["background"])[None, None, :] + gaussian[..., None] * halo_peak[None, None, :]
+        halo = np.asarray(item["background"])[None, None, :] + (
+            gaussian * circular_mask
+        )[..., None] * halo_peak[None, None, :]
         patch = image_data[y0:y1, x0:x1, :]
-        # Gaussian convolution of a Gaussian PSF adds covariance. Peak
-        # normalization plus max/lighten keeps the photographed core intact;
-        # the wider Gaussian wings decay into the measured local background.
-        np.maximum(patch, halo, out=patch)
+        # Blend only the added wing over the original image; the photographed
+        # star core remains untouched and opacity is independent of halo width.
+        np.maximum(patch, halo, out=halo)
+        np.subtract(halo, patch, out=halo)
+        patch += halo * opacity_alpha
         records.append({
             "x_px": round(cx, 2),
             "y_px": round(cy, 2),
             "aperture_flux": round(float(star.flux), 7),
             "relative_flux_ratio": round(float(star.relative_flux_ratio), 6),
-            "radius_curve": "normalized SEP aperture flux ^ 0.5",
+            "radius_curve": "Gaussian fixed-flux isophote; sqrt(log(aperture_flux/faintest_selected_flux))",
+            "source_signal_to_noise": round(float(star.signal_to_noise), 3),
+            "radius_response": round(float(item["isophote_radius_response"]), 5),
             "fwhm_px": round(float(star.fwhm * (scale_x + scale_y) * 0.5), 3),
-            "halo_radius_3sigma_px": round(float(item["radius"]), 2),
-            "diffusion_sigma_px": round(float(item["radius"]) / 3.0 * math.sqrt(float(strength) / 10.0), 3),
+            "halo_radius_3sigma_px": round(3.0 * float(item["sigma"]), 2),
+            "diffusion_sigma_px": round(float(item["diffusion_sigma"]), 3),
+            "circular_mask_outer_radius_px": round(float(item["outer_mask_radius"]), 2),
+            "star_color_rgb_fraction": [round(float(value), 4) for value in item["color_fraction"]],
+            "sky_adaptation_gain": round(sky_gain, 4),
+            "opacity_percent": round(float(opacity), 1),
             "halo_peak_per_channel": [round(float(value), 6) for value in halo_peak],
         })
         if progress and (index == len(prepared) - 1 or index % max(1, len(prepared) // 20) == 0):
-            progress(65 + int(25 * (index + 1) / len(prepared)), f"正在按星像 PSF 扩展光晕… {index + 1}/{len(prepared)}")
+            progress(65 + int(25 * (index + 1) / len(prepared)), f"正在生成正圆柔光并羽化边缘… {index + 1}/{len(prepared)}")
 
     return records
 
@@ -633,6 +722,7 @@ def process_raw(
     *,
     sensitivity: float = 4.8,
     strength: float = 10.0,
+    opacity: float = 30.0,
     star_count_limit: int = 200,
     min_radius: float = 3.0,
     max_radius: float = 42.0,
@@ -649,6 +739,7 @@ def process_raw(
         min_radius, max_radius = max_radius, min_radius
     star_count_limit = int(np.clip(star_count_limit, 0, 500))
     strength = float(np.clip(strength, 0.0, 30.0))
+    opacity = float(np.clip(opacity, 0.0, 100.0))
 
     def report(percent: int, message: str) -> None:
         if progress:
@@ -662,7 +753,7 @@ def process_raw(
             metadata_callback(info)
         detector, _factor = _raster_detector_image(raster.pixels, info.focal_length)
         report(12, "正在识别星点与测量亮度…")
-        stars, candidate_count, selected_count = detect_stars(detector, sensitivity, star_count_limit)
+        stars, candidate_count, selected_count, sky_background_level = detect_stars(detector, sensitivity, star_count_limit)
         image_data = raster.pixels
         profile = raster.profile
         profile_description = raster.profile_description
@@ -695,7 +786,7 @@ def process_raw(
                 metadata_callback(info)
             detector, _factor = _detector_image(raw)
             report(12, "正在识别星点与测量亮度…")
-            stars, candidate_count, selected_count = detect_stars(detector, sensitivity, star_count_limit)
+            stars, candidate_count, selected_count, sky_background_level = detect_stars(detector, sensitivity, star_count_limit)
             report(36, f"SEP 找到 {candidate_count:,} 个点源，选取最亮的 {selected_count:,} 个，正在解码 RAW…")
             rgb = raw.postprocess(
                 gamma=(1, 1),
@@ -728,6 +819,8 @@ def process_raw(
         min_radius,
         max_radius,
         strength,
+        opacity,
+        sky_background_level,
         report,
     )
     report(92, "正在写入 16 位 TIFF…")
@@ -745,7 +838,7 @@ def process_raw(
         del alpha16
 
     description = {
-        "software": "星点柔焦 1.3",
+        "software": f"星点柔焦 {APP_VERSION}",
         "camera": info.camera,
         "lens": info.lens,
         "focal_length_mm": info.focal_length,
@@ -755,11 +848,17 @@ def process_raw(
         "requested_brightest_star_count": star_count_limit,
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
         "star_selection": "top N by SEP circular aperture flux; no catalog magnitude calibration",
-        "soft_focus": "Gaussian PSF convolution-derived broadening: covariance_out=covariance_star+diffusion_sigma^2*I; preserve original core and per-channel peak with max(original, peak-normalized Gaussian wings)",
-        "brightness_to_radius_curve": "halo 3-sigma radius = min_radius + (max_radius-min_radius)*sqrt(star_flux/brightest_flux)",
+        "soft_focus": "circular isotropic Gaussian wings with circular smoothstep feather mask; blend wing opacity over original pixels while retaining original star cores",
+        "brightness_to_radius_curve": "Gaussian fixed-flux isophote: sqrt(log(star_flux/faintest_selected_flux)) normalized to brightest selected star; monotonic in SEP aperture flux; min/max radius bounds apply",
         "soft_focus_strength": round(strength, 1),
-        "soft_focus_strength_note": "diffusion variance ratio relative to strength 10; not alpha opacity; diffusion sigma scales as sqrt(strength/10); peak-preserving photographic bloom is not energy-conserving",
-        "soft_focus_color": "per-channel source amplitude and local background; source RGB color and original ICC retained",
+        "soft_focus_strength_note": "diffusion variance ratio relative to strength 40; default strength 10, maximum 30; diffusion sigma scales as sqrt(strength/40)",
+        "soft_focus_opacity_percent": round(opacity, 1),
+        "soft_focus_color": "background-subtracted RGB aperture chromaticity blended with core chromaticity; per-channel halo and original ICC retained",
+        "sky_background_level": round(sky_background_level, 7),
+        "sky_reference_level": REFERENCE_SKY_LEVEL,
+        "sky_adaptation_gain": round(float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)), 4),
+        "sky_adaptation": "SEP global background; halo wing amplitude scaled in proportion to background luminance with a 0.70x–1.50x clamp (Weber contrast adaptation)",
+        "source_rejection": "SEP PSF matched detection; reject sources with nonstellar roundness, excessive size relative to estimated PSF, or local RMS above 4x image global RMS",
         "star_photometry_and_halo_parameters": star_measurements,
         "encoding": encoding,
         "input_color_profile": profile_description,
@@ -769,7 +868,7 @@ def process_raw(
         write_options = {
             "photometric": photometric,
             "metadata": {"axes": "YXS" if is_rgb or alpha is not None else "YX", **description},
-            "software": "StarSoftFocus 1.3",
+            "software": f"StarSoftFocus {APP_VERSION}",
         }
         if is_rgb:
             write_options["planarconfig"] = "contig"
@@ -799,4 +898,6 @@ def process_raw(
         lens=info.lens,
         input_kind=input_kind,
         color_profile=profile_description,
+        sky_background_level=sky_background_level,
+        sky_adaptation_gain=float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)),
     )

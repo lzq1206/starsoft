@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from PIL import Image
 
 from processor import RawInfo, process_raw
+from version import APP_VERSION
 
 
 APP_NAME = "星点柔焦"
@@ -95,6 +96,8 @@ def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str,
             height=result.height,
             inputKind=result.input_kind,
             colorProfile=result.color_profile,
+            skyBackgroundLevel=result.sky_background_level,
+            skyAdaptationGain=result.sky_adaptation_gain,
             outputName=Path(result.output_path).name,
             preview=preview,
         )
@@ -111,7 +114,7 @@ def _make_handler(token: str):
     base = f"/{token}"
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "StarSoftFocus/1.3"
+        server_version = f"StarSoftFocus/{APP_VERSION}"
         sys_version = ""
 
         def log_message(self, _format: str, *_args: object) -> None:
@@ -149,7 +152,11 @@ def _make_handler(token: str):
                 return
             if route in ("/", ""):
                 try:
-                    html = _asset_path().read_text(encoding="utf-8").replace("__APP_BASE__", base)
+                    html = (
+                        _asset_path().read_text(encoding="utf-8")
+                        .replace("__APP_BASE__", base)
+                        .replace("__APP_VERSION__", APP_VERSION)
+                    )
                 except OSError as exc:
                     self._json(500, {"error": f"无法读取程序界面资源：{exc}"})
                     return
@@ -235,6 +242,7 @@ def _make_handler(token: str):
                 params = {
                     "sensitivity": float(query.get("sensitivity", ["4.8"])[0]),
                     "strength": float(query.get("strength", ["10"])[0]),
+                    "opacity": float(query.get("opacity", ["30"])[0]),
                     "star_count_limit": int(float(query.get("star_count_limit", ["200"])[0])),
                     "min_radius": float(query.get("min_radius", ["3"])[0]),
                     "max_radius": float(query.get("max_radius", ["42"])[0]),
@@ -244,6 +252,7 @@ def _make_handler(token: str):
                 return
             params["sensitivity"] = min(max(params["sensitivity"], 2.0), 10.0)
             params["strength"] = min(max(params["strength"], 0.0), 30.0)
+            params["opacity"] = min(max(params["opacity"], 0.0), 100.0)
             params["star_count_limit"] = min(max(params["star_count_limit"], 0), 500)
             params["min_radius"] = min(max(params["min_radius"], 2.0), 24.0)
             params["max_radius"] = min(max(params["max_radius"], 8.0), 80.0)
