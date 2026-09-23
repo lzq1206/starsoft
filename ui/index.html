@@ -8,7 +8,7 @@
   <style>
     :root{color-scheme:dark;--bg:#0e1017;--panel:#181c26;--panel2:#202634;--edge:#2b3040;--text:#f4f1f8;--muted:#9da4b8;--purple:#c7a9ff;--gold:#f3cb7e;--green:#96d8bd;--red:#f19b9b}
     *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 74% -10%,#282139 0,transparent 37%),var(--bg);color:var(--text);font:14px/1.5 "Microsoft YaHei UI","Segoe UI",sans-serif;min-height:100vh}
-    .shell{max-width:1400px;margin:0 auto;padding:26px 34px 30px}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px}.brand{display:flex;gap:13px;align-items:center}.mark{width:46px;height:46px;border:1px solid #514564;border-radius:50%;display:grid;place-items:center;color:var(--gold);font:27px/1 "Segoe UI Symbol",sans-serif;box-shadow:0 0 34px #c7a9ff18}.brand h1{font-size:20px;line-height:1.2;margin:0 0 4px;letter-spacing:.04em}.brand p{margin:0;color:var(--muted);font-size:12px}.badge{border:1px solid #514564;color:var(--purple);background:#211d2b;padding:8px 12px;border-radius:999px;font-size:11px;letter-spacing:.04em}.badge span{color:var(--green);margin-left:8px}
+    .shell{max-width:1400px;margin:0 auto;padding:26px 34px 30px}.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px;gap:14px}.brand{display:flex;gap:13px;align-items:center}.mark{width:46px;height:46px;border:1px solid #514564;border-radius:50%;display:grid;place-items:center;color:var(--gold);font:27px/1 "Segoe UI Symbol",sans-serif;box-shadow:0 0 34px #c7a9ff18}.brand h1{font-size:20px;line-height:1.2;margin:0 0 4px;letter-spacing:.04em}.brand p{margin:0;color:var(--muted);font-size:12px}.top-actions{display:flex;align-items:center;gap:9px}.badge{border:1px solid #514564;color:var(--purple);background:#211d2b;padding:8px 12px;border-radius:999px;font-size:11px;letter-spacing:.04em;white-space:nowrap}.badge span{color:var(--green);margin-left:8px}.web-link{border:1px solid #514564;color:var(--purple);background:#211d2b;padding:8px 12px;border-radius:999px;font-size:11px;text-decoration:none;white-space:nowrap}.web-link:hover{background:#302842}
     .intro{margin:0 0 22px}.intro .eyebrow,.section-index{color:var(--purple);font-size:10px;font-weight:700;letter-spacing:.13em}.intro h2{font-size:24px;margin:5px 0 4px;font-weight:600}.intro p{margin:0;color:var(--muted);font-size:12px}
     .layout{display:grid;grid-template-columns:minmax(330px,390px) minmax(0,1fr);gap:18px;align-items:stretch}.leftcol{display:flex;flex-direction:column;gap:16px}.section-index{margin:0 0 7px 2px}.card{border:1px solid var(--edge);border-radius:13px;background:linear-gradient(145deg,#191d27,#161922);padding:16px}.card-title{font-weight:650;font-size:14px;margin:0}.subtle{color:var(--muted);font-size:11px;margin:4px 0 0}.drop{margin-top:13px;border:1px dashed #4b475e;border-radius:10px;background:#13151d;min-height:125px;display:flex;flex-direction:column;justify-content:center;align-items:center;text-align:center;padding:12px;transition:.15s;border-color:#474259}.drop.over{border-color:var(--purple);background:#241f31}.drop .cloud{font-size:21px;color:var(--gold);margin-bottom:4px}.drop strong{font-size:12px}.drop small{font-size:10px;color:var(--muted);margin:4px 0 10px}.file-button,.secondary,.primary,.download,.exit{font:inherit;border:0;border-radius:8px;cursor:pointer;transition:filter .15s,transform .15s}.file-button,.secondary{color:var(--text);background:#2a3040;padding:8px 12px;font-size:11px}.file-button:hover,.secondary:hover,.download:hover{filter:brightness(1.16)}input[type=file]{display:none}.file-meta{display:none;margin-top:11px;padding:10px 11px;background:#202633;border-radius:8px;overflow-wrap:anywhere}.file-meta.show{display:block}.filename{font-size:12px;font-weight:600}.filesub{color:var(--muted);font-size:10px;margin-top:3px}.meta-line{color:var(--green);font-size:10px;margin-top:5px}.group{display:flex;justify-content:space-between;align-items:center;margin-top:14px}.group:first-of-type{margin-top:13px}.group label{font-size:12px}.value{color:var(--gold);font-variant-numeric:tabular-nums;font-size:11px;font-weight:650}.range{appearance:none;width:100%;height:5px;background:#333a4b;border-radius:9px;outline:none;margin:10px 0 2px}.range::-webkit-slider-thumb{appearance:none;width:14px;height:14px;border-radius:50%;background:var(--purple);border:2px solid #faf7ff;box-shadow:0 0 10px #c7a9ff55;cursor:pointer}.range::-moz-range-thumb{width:11px;height:11px;border-radius:50%;background:var(--purple);border:2px solid #faf7ff;cursor:pointer}.hint{color:var(--muted);font-size:10px;margin:9px 0 0}.export{display:flex;justify-content:space-between;align-items:center}.export b{color:var(--green);font-size:11px}.export span{color:var(--muted);font-size:10px}
     .primary{width:100%;padding:12px 15px;background:linear-gradient(105deg,#d7c4ff,#b99bf1);color:#20182e;font-weight:750;letter-spacing:.02em;box-shadow:0 7px 22px #a588dc22}.primary:hover{filter:brightness(1.07);transform:translateY(-1px)}.primary:disabled{cursor:not-allowed;filter:saturate(.25);opacity:.6;transform:none}.rightcol{min-height:590px;display:flex;flex-direction:column}.preview-head{display:flex;justify-content:space-between;align-items:center;margin:0 2px 8px}.preview-head h3{margin:0;font-size:14px}.preview-head span{font-size:10px;color:var(--muted)}.preview-card{position:relative;flex:1;min-height:470px;display:grid;place-items:center;overflow:hidden;border:1px solid var(--edge);border-radius:13px;background:#0a0b10}.preview-card:before{content:"";position:absolute;inset:0;background-image:radial-gradient(1px 1px at 14% 25%,#b9a8ff99 99%,transparent),radial-gradient(1px 1px at 63% 14%,#fff7d399 99%,transparent),radial-gradient(1px 1px at 89% 31%,#fff9 99%,transparent),radial-gradient(1px 1px at 29% 76%,#fff8 99%,transparent),radial-gradient(1px 1px at 73% 83%,#c7a9ff77 99%,transparent);opacity:.42;pointer-events:none}.placeholder{position:relative;z-index:1;text-align:center;color:var(--muted);padding:25px}.placeholder .bigstar{font:52px/1 "Segoe UI Symbol";color:#d1b8ff;opacity:.75;text-shadow:0 0 35px #b494ee88}.placeholder b{display:block;color:#d2cddd;font-size:13px;font-weight:550;margin-top:12px}.placeholder small{display:block;font-size:10px;margin-top:4px}.preview-img{position:absolute;z-index:2;inset:0;width:100%;height:100%;object-fit:contain;background:#08090d;display:none}.progress-card{margin-top:12px;padding:13px 15px;border:1px solid var(--edge);border-radius:11px;background:var(--panel)}.progress-top{display:flex;justify-content:space-between;gap:15px;font-size:11px}.progress-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.percent{color:var(--purple);font-weight:700;font-variant-numeric:tabular-nums}.track{height:5px;background:#303644;border-radius:99px;margin-top:9px;overflow:hidden}.bar{height:100%;width:0;background:linear-gradient(90deg,#a989eb,#dfc8ff);border-radius:99px;transition:width .25s}.result{display:none;align-items:center;justify-content:space-between;gap:10px;margin-top:11px}.result.show{display:flex}.result-meta{color:var(--green);font-size:10px;overflow-wrap:anywhere}.download{color:#20182e;background:var(--green);padding:8px 11px;font-size:10px;font-weight:700;white-space:nowrap}.exit{margin-top:13px;background:transparent;color:#84899b;font-size:10px;padding:4px 0}.exit:hover{color:var(--text)}.footer{margin-top:13px;color:#747b8d;font-size:10px;display:flex;justify-content:space-between;gap:10px}.error{color:var(--red)!important}
@@ -20,9 +20,9 @@
   <main class="shell">
     <header class="topbar">
       <div class="brand"><div class="mark">✦</div><div><h1>星点柔焦</h1><p>为夜空里的每颗星，量身调整柔光范围</p></div></div>
-      <div class="badge">RAW · TIFF · JPG <span>→</span> 16-bit TIFF <span>· 本机处理</span></div>
+      <div class="top-actions"><a id="webLink" class="web-link" href="#" target="_blank" rel="noopener">网页版</a><div class="badge">RAW · TIFF · JPG <span>→</span> 16-bit TIFF <span>· 本机处理</span></div></div>
     </header>
-    <section class="intro"><div class="eyebrow">STAR SOFT FOCUS&nbsp; / &nbsp;01</div><h2>让星光自然铺开</h2><p>自动识别点源并按 SEP 测得的亮度排序，以星像 PSF 扩展出平滑、保留颜色的光晕。</p></section>
+    <section class="intro"><div class="eyebrow">STAR SOFT FOCUS&nbsp; / &nbsp;01</div><h2>让星光自然铺开</h2><p>自动识别点源并按 SEP 测得的亮度排序，将实测星像径向 PSF 与正圆高斯散射核卷积，形成保留颜色的光晕。</p></section>
 
     <div class="layout">
       <section class="leftcol">
@@ -54,7 +54,7 @@
             <input id="minRadius" class="range" type="range" min="2" max="24" step="1" value="3">
             <div class="group"><label for="maxRadius">最大柔焦半径</label><span id="maxValue" class="value"></span></div>
             <input id="maxRadius" class="range" type="range" min="8" max="80" step="1" value="42">
-            <p class="hint">此项设置相对于天空区域最亮点源的相对星等差上限，默认 3.0 等。数值越大，纳入的较暗点源越多，达标点源全部处理且不设数量上限。亮度来自 SEP 圆孔径测光，属于画面内相对值，不是星表绝对星等。强度默认 10、最高 30，控制扩散宽度；光晕不透明度默认 30%，数值越高光晕越明显。亮度同时决定光晕半径与强度。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。星色取自原图 RGB 孔径测光。</p>
+            <p class="hint">此项设置相对于天空区域最亮点源的相对星等差上限，默认 3.0 等。数值越大，纳入的较暗点源越多，达标点源全部处理且不设数量上限。亮度来自 SEP 圆孔径测光，属于画面内相对值，不是星表绝对星等。算法从星点周围实测 RGB 剖面出发，以横纵扩散宽度相同的正圆高斯核作卷积：核心随光线扩散而减弱，外圈形成渐淡的正圆光晕；不会依据星像长短轴拉成椭圆。强度默认 10、最高 30，控制扩散宽度；光晕不透明度默认 30%，单独控制卷积结果的混合量。亮星获得较宽范围，暗星范围自动收窄。星云、星系等弥散结构不作为星点柔化；球状星团中的紧致成员星可在拥挤星场中继续识别。场景预览会估计地平线并遮罩前景区域。</p>
           </div>
         </div>
         <div class="export-wrap">
@@ -75,15 +75,27 @@
           <div class="track"><div id="bar" class="bar"></div></div>
           <div id="result" class="result"><span id="resultMeta" class="result-meta"></span><a id="download" class="download" href="#">下载 16 位 TIFF</a></div>
         </div>
-        <div class="footer"><span>星点柔焦 v__APP_VERSION__&nbsp; · &nbsp;SEP 点源检测与测光</span><span>本地运行，不上传图片</span></div>
+        <div class="footer"><span>星点柔焦 v__APP_VERSION__&nbsp; · &nbsp;SEP 点源检测与测光</span><span>文件只传到本机引擎，不上传网站</span></div>
         <button id="exit" class="exit">退出程序</button>
       </section>
     </div>
   </main>
   <script>
-    const BASE="__APP_BASE__";
+    const WEB_APP_URL="https://lzq1206.github.io/starsoft/app/";
     const $=id=>document.getElementById(id);
+    const pageParams=new URLSearchParams(location.search);
+    const remoteBase=pageParams.get("local");
+    let BASE="__APP_BASE__";
+    const isPages=location.hostname==="lzq1206.github.io";
+    let engineReady=!isPages;
+    if(isPages){
+      BASE="";
+      if(remoteBase){try{const endpoint=new URL(remoteBase);if(endpoint.protocol==="http:"&&["127.0.0.1","localhost","[::1]"].includes(endpoint.hostname)&&!endpoint.username&&!endpoint.password&&!endpoint.search&&!endpoint.hash){BASE=endpoint.origin+endpoint.pathname.replace(/\/+$/,"");engineReady=true;}}catch(_){}}
+    }
+    const webLink=$("webLink");
+    if(webLink){if(isPages){webLink.hidden=true;}else{const endpoint=new URL(BASE,location.href);webLink.href=`${WEB_APP_URL}?local=${encodeURIComponent(endpoint.origin+endpoint.pathname.replace(/\/+$/, ""))}`;}}
     const fileInput=$("file"), drop=$("drop"), start=$("start");
+    if(isPages&&!BASE)$("exit").hidden=true;
     let selectedFile=null, currentJob=null, busy=false;
     const setStatus=(text,percent=null)=>{ $("status").textContent=text; if(percent!==null){$("percent").textContent=`${percent}%`;$("bar").style.width=`${percent}%`;} };
     const formatBytes=n=>n<1024*1024?`${(n/1024).toFixed(0)} KB`:`${(n/1024/1024).toFixed(1)} MB`;
@@ -94,7 +106,8 @@
     slider("relativeMagnitudeLimit","relativeMagnitudeLimitValue",v=>`Δm ≤ ${v.toFixed(1)} 等`);
     slider("minRadius","minValue",v=>`${v.toFixed(0)} px`);
     slider("maxRadius","maxValue",v=>`${v.toFixed(0)} px`);
-    function chooseFile(file){if(!file)return;selectedFile=file;$("fileMeta").classList.add("show");$("fileName").textContent=file.name;$("fileSize").textContent=formatBytes(file.size);$("lensMeta").textContent="处理时读取图像与可用的镜头信息";start.disabled=busy;$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="文件已就绪，可以开始处理";setStatus("图像文件已就绪 · 可调整星点识别与柔焦范围",0);}
+    function chooseFile(file){if(!file)return;selectedFile=file;$("fileMeta").classList.add("show");$("fileName").textContent=file.name;$("fileSize").textContent=formatBytes(file.size);$("lensMeta").textContent="处理时读取图像与可用的镜头信息";start.disabled=busy||!engineReady;$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="文件已就绪，可以开始处理";setStatus(engineReady?"图像文件已就绪 · 可调整星点识别与柔焦范围":"请先运行本机星点柔焦程序，再从程序打开网页版",0);}
+    async function checkEngine(){if(!BASE){engineReady=false;start.disabled=true;setStatus("请先下载并打开本机星点柔焦程序；程序启动后会自动连接本网页。",0);return;}try{const response=await fetch(`${BASE}/api/health`);const status=await response.json();if(!response.ok||!status.ok)throw new Error("本机引擎未响应");engineReady=true;start.disabled=!selectedFile;setStatus("已连接本机处理引擎 · 图片不会上传到网站",0);}catch(_){engineReady=false;start.disabled=true;setStatus("无法连接本机引擎，请重新打开星点柔焦程序生成的网页版窗口。",0);}}
     fileInput.addEventListener("change",e=>chooseFile(e.target.files[0]));
     ["dragenter","dragover"].forEach(name=>drop.addEventListener(name,e=>{e.preventDefault();drop.classList.add("over");}));
     ["dragleave","drop"].forEach(name=>drop.addEventListener(name,e=>{e.preventDefault();drop.classList.remove("over");}));
@@ -105,11 +118,12 @@
         $("result").classList.add("show");busy=false;start.disabled=false;start.textContent="✦  更改参数后再次处理";setStatus("柔焦完成",100);return;}
       if(job.state==="error")throw new Error(job.message||"处理失败");
       setTimeout(()=>pollJob(id),650);
-    }catch(error){busy=false;start.disabled=!selectedFile;start.textContent="✦  开始星点柔焦";setStatus(error.message,0);$("status").classList.add("error");}}
+    }catch(error){busy=false;start.disabled=!selectedFile||!engineReady;start.textContent="✦  开始星点柔焦";setStatus(error.message,0);$("status").classList.add("error");}}
     start.addEventListener("click",async()=>{if(!selectedFile||busy)return;busy=true;start.disabled=true;start.textContent="正在处理…";$("status").classList.remove("error");$("result").classList.remove("show");$("preview").style.display="none";$("placeholder").style.display="block";$("placeholder").querySelector("b").textContent="正在识别星点";$("previewLabel").textContent="本机处理进行中";setStatus("正在上传图像到本机处理进程…",2);
       const params=new URLSearchParams({sensitivity:$("sensitivity").value,strength:$("strength").value,opacity:$("opacity").value,relative_magnitude_limit:$("relativeMagnitudeLimit").value,min_radius:$("minRadius").value,max_radius:$("maxRadius").value});
       try{const body=await new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("POST",`${BASE}/api/jobs?${params}`);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.setRequestHeader("X-File-Name",encodeURIComponent(selectedFile.name));xhr.upload.onprogress=e=>{if(e.lengthComputable)setStatus(`正在上传图像… ${formatBytes(e.loaded)} / ${formatBytes(e.total)}`,Math.round(2+8*e.loaded/e.total));};xhr.onload=()=>{let data={};try{data=JSON.parse(xhr.responseText);}catch(_){}if(xhr.status<200||xhr.status>=300)reject(new Error(data.error||"无法开始处理"));else resolve(data);};xhr.onerror=()=>reject(new Error("与本机处理进程的连接中断"));xhr.send(selectedFile);});currentJob=body.id;setStatus("文件已接收，正在识别星点…",10);pollJob(currentJob);}catch(error){busy=false;start.disabled=false;start.textContent="✦  开始星点柔焦";$("status").classList.add("error");setStatus(error.message,0);}});
     $("exit").addEventListener("click",async()=>{if(busy&&!confirm("处理正在进行。退出会中断本次处理，确定退出吗？"))return;$("exit").textContent="正在退出…";try{await fetch(`${BASE}/api/shutdown`,{method:"POST"});}catch(_){}document.body.innerHTML='<main style="font:14px Microsoft YaHei UI, sans-serif;color:#eee;background:#0e1017;height:100vh;display:grid;place-items:center;text-align:center"><div><div style="font-size:34px;color:#c7a9ff">✦</div><b>星点柔焦已关闭</b><p style="color:#9da4b8">可以关闭此浏览器页面。</p></div></main>';});
+    checkEngine();
   </script>
 </body>
 </html>

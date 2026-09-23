@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>星点柔焦 · RAW 星点光晕</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0d1018;--panel:#181d28;--line:#32384a;--text:#f4f1f8;--muted:#a5abc0;--purple:#cfb9ff;--gold:#f3cf8d;--green:#99e1c4}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 75% -15%,#332744 0,transparent 43%),var(--bg);color:var(--text);font:16px/1.65 "Segoe UI","Microsoft YaHei UI",sans-serif}.page{max-width:1040px;margin:0 auto;padding:38px 24px 64px}.brand{display:flex;align-items:center;gap:14px}.mark{width:48px;height:48px;border:1px solid #615278;border-radius:50%;display:grid;place-items:center;color:var(--gold);font-size:29px}.brand h1{font-size:22px;margin:0}.brand p{font-size:12px;color:var(--muted);margin:1px 0}.hero{padding:72px 0 46px;max-width:780px}.eyebrow{color:var(--purple);font-size:12px;font-weight:700;letter-spacing:.15em}.hero h2{font-size:clamp(34px,7vw,62px);line-height:1.1;margin:12px 0 18px}.hero>p{color:#c2c6d3;font-size:17px;max-width:690px}.actions{display:flex;gap:12px;flex-wrap:wrap;margin:28px 0 18px}.button{display:inline-block;text-decoration:none;border:1px solid var(--line);border-radius:10px;padding:11px 17px;color:var(--text);background:#232939;font-weight:650}.button.primary{background:var(--purple);border-color:var(--purple);color:#241b35}.button:hover{filter:brightness(1.09)}.caption{font-size:12px;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-top:18px}.card{border:1px solid var(--line);border-radius:14px;padding:20px;background:linear-gradient(145deg,#1a1f2b,#151923)}.card h3{font-size:15px;margin:0 0 7px}.card p{font-size:13px;color:var(--muted);margin:0}.section{margin-top:28px}.section h3{font-size:17px}.footer{margin-top:38px;border-top:1px solid var(--line);padding-top:18px;color:var(--muted);font-size:12px}.footer a{color:var(--purple)}@media(max-width:700px){.page{padding:24px 17px 44px}.hero{padding:50px 0 30px}.grid{grid-template-columns:1fr}.hero>p{font-size:15px}}
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="brand"><div class="mark">✦</div><div><h1>星点柔焦</h1><p>为夜空里的星点生成自然、保留颜色的圆形光晕</p></div></header>
+    <section class="hero">
+      <div class="eyebrow">STAR SOFT FOCUS · VERSION __VERSION__</div>
+      <h2>让星光自然铺开</h2>
+      <p>自动识别天空中的点源，按 SEP 测得的相对亮度调整扩散范围。高斯散射核把光从星点核心重新分布到渐淡的圆形外翼，输出保留输入色彩空间的 16 位 TIFF。</p>
+      <div class="actions">
+        <a class="button primary" href="app/">打开网页版</a>
+        <a class="button" href="https://github.com/lzq1206/starsoft/releases/download/v__VERSION__/星点柔焦-v__VERSION__-win-x64.zip">Windows 下载</a>
+        <a class="button" href="https://github.com/lzq1206/starsoft/releases/download/v__VERSION__/星点柔焦-v__VERSION__-macos-arm64.zip">Mac Apple 芯片下载</a>
+        <a class="button" href="https://github.com/lzq1206/starsoft/releases/download/v__VERSION__/星点柔焦-v__VERSION__-macos-x64.zip">Mac Intel 下载</a>
+      </div>
+      <div class="caption">网页版使用本机处理程序执行 RAW 解码、SEP 星点检测和 16 位 TIFF 导出。图像仅通过本机回环连接传给电脑上的程序，不上传到网站。</div>
+    </section>
+    <section class="grid">
+      <article class="card"><h3>基于 SEP 星点测光</h3><p>在天空遮罩中估计局部背景、识别点源并按孔径通量排序；较暗星点自动使用较小的扩散范围。</p></article>
+      <article class="card"><h3>保留实测 PSF 与星色</h3><p>以源图逐星 RGB 径向剖面与归一化高斯核卷积，核心光线向外扩散，边缘用圆形羽化遮罩融入天光。</p></article>
+      <article class="card"><h3>相机文件在本机处理</h3><p>本机引擎支持 RAW、TIFF 和 JPG 输入，读取可用镜头信息，并生成 16 位 TIFF。</p></article>
+    </section>
+    <section class="section"><h3>开始处理</h3><div class="card"><p>先下载并运行对应系统的星点柔焦程序。程序会自动打开带本机临时连接的网页版；之后在网页选择图像并设置参数。直接打开“网页版”而未运行本机程序时，页面会显示引擎未连接。</p></div></section>
+    <footer class="footer">版本 __VERSION__ · <a href="https://github.com/lzq1206/starsoft">GitHub 源码与说明</a> · 使用许可证见仓库 LICENSE</footer>
+  </main>
+</body>
+</html>

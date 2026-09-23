@@ -1,5 +1,6 @@
 .venv/
 build/
+build-macos-*/
 dist/
 __pycache__/
 *.spec

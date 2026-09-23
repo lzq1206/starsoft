@@ -1,0 +1,49 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - "ui/index.html"
+      - "version.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Build static web front end
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' version.py)"
+          test -n "$version"
+          mkdir -p _site/app
+          sed "s/__VERSION__/$version/g" web/index.html > _site/index.html
+          sed -e "s/__APP_BASE__//g" -e "s/__APP_VERSION__/$version/g" ui/index.html > _site/app/index.html
+          touch _site/.nojekyll
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

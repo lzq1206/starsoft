@@ -15,13 +15,16 @@ import numpy as np
 import rawpy
 import sep
 import tifffile
+from scipy.ndimage import gaussian_filter
 from PIL import ExifTags, Image, ImageCms, ImageFilter, ImageOps
 
 from version import APP_VERSION
 
 
 Progress = Callable[[int, str], None]
-REFERENCE_SKY_LEVEL = 0.05134
+# Measured by SEP globalback on the sky-masked LZQ_9331.tif detector image.
+# Keep this on the same masked sky region used for per-image measurements.
+REFERENCE_SKY_LEVEL = 0.17277
 
 
 @dataclass(frozen=True)
@@ -833,26 +836,37 @@ def _soften_stars(
         min_radius, max_radius = max_radius, min_radius
     opacity_alpha = float(np.clip(opacity, 0.0, 100.0)) / 100.0
     # Weber contrast is the luminance difference divided by background
-    # luminance. Scale the added wings in proportion to the measured sky level
-    # so the halo keeps a similar relationship to the sky across exposures.
+    # luminance. Scale the flux-conserving redistribution by the measured sky
+    # level so its visibility stays comparable across differently developed
+    # images.
     sky_gain = float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50))
     prepared: list[dict[str, object]] = []
 
-    # Capture each source profile before adding any halos. SEP's second moments
-    # define a Gaussian approximation to the measured point-spread function.
+    # Capture each source profile before adding any halos. This scalar only
+    # sizes the circular processing mask; no major/minor axis or angle is used.
     for star in stars:
         cx = (star.x + 0.5) * scale_x - 0.5
         cy = (star.y + 0.5) * scale_y - 0.5
         center_x = int(np.clip(round(cx), 0, out_w - 1))
         center_y = int(np.clip(round(cy), 0, out_h - 1))
-        a = max(float(star.a) * scale_x, 0.45)
-        b = max(float(star.b) * scale_y, 0.45)
-        # SEP shape moments size the local measurement patch; the generated
-        # scattering wing itself is always a circular, separate Gaussian.
-        source_sigma = math.sqrt((a * a + b * b) * 0.5)
+        # SEP's scalar circularized FWHM sets only a radial support estimate.
+        # The measured profile and every generated halo remain strictly round.
+        source_sigma = max(
+            float(star.fwhm) * (scale_x + scale_y) * 0.5 / 2.354820045,
+            0.45,
+        )
         widest_diffusion_sigma = (max_radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 40.0)
         probe_sigma = math.sqrt(source_sigma * source_sigma + widest_diffusion_sigma * widest_diffusion_sigma)
-        extent = max(8, int(math.ceil(4.0 * probe_sigma)))
+        source_support_radius = float(np.clip(
+            2.0 * star.fwhm * (scale_x + scale_y) * 0.5,
+            8.0,
+            96.0,
+        ))
+        extent = max(
+            8,
+            int(math.ceil(4.0 * probe_sigma)),
+            int(math.ceil(source_support_radius + 4.0 * widest_diffusion_sigma)),
+        )
         x0, x1 = max(0, center_x - extent), min(out_w, center_x + extent + 1)
         y0, y1 = max(0, center_y - extent), min(out_h, center_y + extent + 1)
         source_patch = image_data[y0:y1, x0:x1, :]
@@ -861,6 +875,39 @@ def _soften_stars(
             axis=0,
         )
         local_background = np.median(border, axis=0)
+        # Measure a circular stellar profile directly from this developed
+        # image. SEP moments can include asymmetric optical wings or nearby
+        # diffuse structure, so using them as a single Gaussian source model
+        # made the synthetic halo too narrow on the 9331 TIFF. Annular medians
+        # retain the observed stellar PSF while rejecting non-radial context.
+        yy_profile, xx_profile = np.ogrid[y0:y1, x0:x1]
+        radius_profile = np.hypot(xx_profile - cx, yy_profile - cy)
+        radius_bins = np.floor(radius_profile).astype(np.int32)
+        profile_count = int(math.ceil(source_support_radius)) + 1
+        source_signal = np.maximum(source_patch - local_background[None, None, :], 0.0)
+        radial_profile = np.zeros((profile_count, image_data.shape[2]), dtype=np.float32)
+        for radius_bin in range(profile_count):
+            ring_pixels = source_signal[radius_bins == radius_bin]
+            if ring_pixels.size:
+                radial_profile[radius_bin] = np.median(ring_pixels, axis=0)
+        populated_bins = np.flatnonzero(np.any(radial_profile > 0, axis=1))
+        if populated_bins.size:
+            all_bins = np.arange(profile_count)
+            for channel in range(image_data.shape[2]):
+                channel_bins = np.flatnonzero(radial_profile[:, channel] > 0)
+                if channel_bins.size:
+                    radial_profile[:, channel] = np.interp(
+                        all_bins,
+                        channel_bins,
+                        radial_profile[channel_bins, channel],
+                        left=radial_profile[channel_bins[0], channel],
+                        right=0.0,
+                    )
+            fade_start = min(profile_count - 1, int(source_support_radius * 0.85))
+            if fade_start < profile_count - 1:
+                fade = np.linspace(1.0, 0.0, profile_count - fade_start, dtype=np.float32)
+                fade = fade * fade * (3.0 - 2.0 * fade)
+                radial_profile[fade_start:] *= fade[:, None]
         core = image_data[
             max(0, center_y - 2) : min(out_h, center_y + 3),
             max(0, center_x - 2) : min(out_w, center_x + 3),
@@ -896,6 +943,9 @@ def _soften_stars(
             "x1": x1,
             "y0": y0,
             "y1": y1,
+            "source_sigma": source_sigma,
+            "source_support_radius": source_support_radius,
+            "radial_profile": radial_profile,
             "sigma": probe_sigma,
             "inner_mask_radius": 3.0 * probe_sigma,
             "outer_mask_radius": 4.0 * probe_sigma,
@@ -913,25 +963,23 @@ def _soften_stars(
         math.log(max(brightest_flux, 1e-20) / max(flux_floor, 1e-20)),
         0.0,
     )
-    reference_peak = max(float(item["source_peak"]) for item in prepared)
     for item in prepared:
         star = item["star"]
         log_flux = max(math.log(max(float(star.flux), 1e-20) / max(flux_floor, 1e-20)), 0.0)
         response = float(np.clip(log_flux / max_log_flux, 0.0, 1.0)) if max_log_flux > 1e-12 else 1.0
         radius = min_radius + (max_radius - min_radius) * response
         diffusion_sigma = (radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 40.0)
-        # A star's halo peak follows its measured SEP aperture flux. Using the
-        # brightest selected core as the radiometric reference keeps the halo
-        # in the developed image's units while reducing faint-star intensity.
+        # Convolution with a normalized Gaussian scattering kernel preserves
+        # the measured radial PSF's integrated light. Its actual profile and
+        # per-radius RGB colour are retained below rather than assuming that
+        # SEP's second moments describe the star core.
         flux_scale = float(np.clip(star.relative_flux_ratio, 0.0, 1.0))
-        color_fraction = np.asarray(item["color_fraction"])
-        color_max = max(float(np.max(color_fraction)), 1e-12)
-        item["amplitude"] = (
-            reference_peak * flux_scale * (color_fraction / color_max) * sky_gain
-        )
-        # The added scattering wing has its own circular Gaussian width. The
-        # original, possibly imperfect stellar core remains unmodified below.
-        output_sigma = diffusion_sigma
+        source_sigma = max(float(item["source_sigma"]), 1e-6)
+        output_sigma = math.sqrt(source_sigma**2 + diffusion_sigma**2)
+        # Optical diffusion convolves with the measured stellar PSF. Gaussian
+        # variances add; the normalized isotropic kernel moves light from the
+        # core into circular wings. The circular feather mask only limits the
+        # finite processing region and does not change the halo's geometry.
         item["radius"] = radius
         item["diffusion_sigma"] = diffusion_sigma
         item["sigma"] = output_sigma
@@ -953,28 +1001,46 @@ def _soften_stars(
         yy, xx = np.ogrid[y0:y1, x0:x1]
         dx, dy = xx - cx, yy - cy
         radial_squared = dx * dx + dy * dy
-        sigma = float(item["sigma"])
-        gaussian = np.exp(-0.5 * radial_squared / max(sigma * sigma, 1e-12)).astype(np.float32)
+        radial_distance = np.sqrt(radial_squared)
+        radial_profile = np.asarray(item["radial_profile"], dtype=np.float32)
+        profile_radius = np.arange(radial_profile.shape[0], dtype=np.float32)
+        source_model = np.stack(
+            [
+                np.interp(
+                    radial_distance.ravel(),
+                    profile_radius,
+                    radial_profile[:, channel],
+                    right=0.0,
+                ).reshape(radial_distance.shape)
+                for channel in range(image_data.shape[2])
+            ],
+            axis=-1,
+        ).astype(np.float32, copy=False)
+        target_model = gaussian_filter(
+            source_model,
+            sigma=(float(item["diffusion_sigma"]), float(item["diffusion_sigma"]), 0.0),
+            mode="constant",
+            cval=0.0,
+            truncate=4.0,
+        )
         inner_radius = float(item["inner_mask_radius"])
         outer_radius = float(item["outer_mask_radius"])
         feather = max(outer_radius - inner_radius, 1e-6)
         mask_t = np.clip((outer_radius - np.sqrt(radial_squared)) / feather, 0.0, 1.0)
         circular_mask = mask_t * mask_t * (3.0 - 2.0 * mask_t)
-        halo_peak = np.asarray(item["amplitude"])
-        halo = np.asarray(item["background"])[None, None, :] + (
-            gaussian[..., None] * halo_peak[None, None, :]
-        )
+        halo_peak = np.max(target_model, axis=(0, 1))
         patch = image_data[y0:y1, x0:x1, :]
-        # Subtract the original image from the unmasked target PSF, then apply
-        # the circular feather once. This leaves all pixels outside the circle
-        # unchanged, including pixels below the local sky level.
-        np.subtract(halo, patch, out=halo)
-        np.maximum(halo, 0.0, out=halo)
-        halo *= circular_mask[..., None]
-        patch += halo * opacity_alpha
+        # Blend the signed difference between measured and convolved radial
+        # profiles. Negative differences reduce the core as light moves
+        # outward; RGB profiles preserve the star's measured color. The mask
+        # keeps the feather circular and leaves its exterior untouched.
+        np.subtract(target_model, source_model, out=target_model)
+        target_model *= circular_mask[..., None]
+        patch += target_model * (opacity_alpha * sky_gain)
         records.append({
             "x_px": round(cx, 2),
             "y_px": round(cy, 2),
+            "halo_geometry": "circle; isotropic x/y Gaussian convolution",
             "aperture_flux": round(float(star.flux), 7),
             "relative_flux_ratio": round(float(star.relative_flux_ratio), 6),
             "radius_curve": "linear response to relative stellar magnitude; log(aperture_flux/faintest_selected_flux)",
@@ -983,6 +1049,8 @@ def _soften_stars(
             "halo_flux_scale": round(float(item["halo_flux_scale"]), 6),
             "fwhm_px": round(float(star.fwhm * (scale_x + scale_y) * 0.5), 3),
             "halo_radius_3sigma_px": round(3.0 * float(item["sigma"]), 2),
+            "source_psf_sigma_px": round(float(item["source_sigma"]), 3),
+            "effective_halo_sigma_px": round(float(item["sigma"]), 3),
             "diffusion_sigma_px": round(float(item["diffusion_sigma"]), 3),
             "circular_mask_outer_radius_px": round(float(item["outer_mask_radius"]), 2),
             "star_color_rgb_fraction": [round(float(value), 4) for value in item["color_fraction"]],
@@ -1202,17 +1270,18 @@ def process_raw(
         "relative_magnitude_limit": relative_magnitude_limit,
         "relative_flux_floor_ratio": round(10.0 ** (-0.4 * relative_magnitude_limit), 8),
         "relative_magnitude_difference_definition": "delta_magnitude=-2.5*log10(flux_ratio), relative to the brightest point source in the detected sky area; include candidates where delta_magnitude is at most the selected limit",
-        "soft_focus": "circular isotropic Gaussian wings with circular smoothstep feather mask; only the positive difference from the target halo profile is blended, leaving pixels outside the circular mask unchanged",
+        "soft_focus": "strictly circular isotropic Gaussian diffusion convolved with an RGB stellar radial profile sampled by circular-annulus medians; x and y sigma are equal and SEP ellipticity/angle never shapes the halo; the normalized kernel conserves integrated profile flux; signed source-to-target profile difference is opacity and sky-adaptation blended with a circular smoothstep feather mask",
+        "halo_geometry": "strictly circular; Euclidean radial bins and equal x/y Gaussian sigma; source ellipticity and position angle are not used to shape the halo",
         "brightness_to_radius_curve": "linear response to relative stellar magnitude: log(aperture_flux/faintest_selected_flux) normalized to brightest selected star, matching 18ffa10 mapping",
-        "brightness_to_halo_strength_curve": "halo peak scales linearly with SEP aperture-flux ratio to the brightest selected star; faint stars receive smaller halos as well as smaller radii",
+        "brightness_to_halo_strength_curve": "each selected star's measured RGB radial profile is scattered by a normalized Gaussian kernel; SEP aperture flux sets its relative-magnitude radius, so faint stars receive a narrower redistribution",
         "soft_focus_strength": round(strength, 1),
-        "soft_focus_strength_note": "diffusion variance ratio relative to strength 40; default strength 10, maximum 30; diffusion sigma scales as sqrt(strength/40)",
+        "soft_focus_strength_note": "Gaussian scattering-kernel sigma=(radius/3)*sqrt(strength/40); default strength 10, maximum 30; opacity controls the blend amount independently",
         "soft_focus_opacity_percent": round(opacity, 1),
         "soft_focus_color": "background-subtracted RGB aperture chromaticity blended with core chromaticity; per-channel halo and original ICC retained",
         "sky_background_level": round(sky_background_level, 7),
         "sky_reference_level": REFERENCE_SKY_LEVEL,
         "sky_adaptation_gain": round(float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)), 4),
-        "sky_adaptation": "SEP global background; halo wing amplitude scaled in proportion to background luminance with a 0.70x–1.50x clamp (Weber contrast adaptation)",
+        "sky_adaptation": "SEP global background measured within the detected sky mask; opacity blending of the flux-conserving radial-profile redistribution is scaled in proportion to sky luminance with a 0.70x–1.50x clamp (Weber contrast adaptation)",
         "source_rejection": "sky-region mask; SEP PSF matched detection; reject sources with roundness below 0.35, minor-axis size below 0.35 px, major-axis size above max(6 px, 5x estimated PSF sigma) capped at 12 px, or local RMS above 4x sky-only global RMS except compact sources in dense stellar fields",
         "star_photometry_and_halo_parameters": star_measurements,
         "crowded_stellar_field_sources": sum(star.crowded_field for star in stars),

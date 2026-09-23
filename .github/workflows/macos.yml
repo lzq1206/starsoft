@@ -1,0 +1,87 @@
+name: Build macOS releases
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app.py"
+      - "processor.py"
+      - "requirements.txt"
+      - "ui/index.html"
+      - "version.py"
+      - "README.md"
+      - "LICENSE"
+      - "build_macos.sh"
+      - ".github/workflows/macos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build app bundle and zip
+        run: bash build_macos.sh
+      - name: Upload macOS build
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            releases/星点柔焦-v*-macos-${{ matrix.arch }}.zip
+            releases/星点柔焦-v*-macos-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish versioned release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Download macOS builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          merge-multiple: true
+          path: release-assets
+      - name: Add Windows build and publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' version.py)"
+          tag="v${version}"
+          windows_zip="releases/星点柔焦-v${version}-win-x64.zip"
+          test -f "$windows_zip"
+          cp "$windows_zip" release-assets/
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh release create "$tag" release-assets/* \
+              --target "$GITHUB_SHA" \
+              --title "星点柔焦 ${version}" \
+              --notes "Windows、macOS Apple 芯片与 Intel 版本。macOS 包目前未使用 Apple Developer ID 签名或公证。"
+          fi

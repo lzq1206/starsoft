@@ -23,6 +23,7 @@ from version import APP_VERSION
 
 
 APP_NAME = "星点柔焦"
+PAGES_ORIGIN = "https://lzq1206.github.io"
 MAX_UPLOAD = 1_500_000_000
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -128,6 +129,11 @@ def _make_handler(token: str):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+            origin = self.headers.get("Origin")
+            if origin == PAGES_ORIGIN:
+                self.send_header("Access-Control-Allow-Origin", PAGES_ORIGIN)
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+                self.send_header("Vary", "Origin")
             if extra:
                 for key, value in extra.items():
                     self.send_header(key, value)
@@ -163,6 +169,9 @@ def _make_handler(token: str):
                 self._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
                 return
             parts = route.strip("/").split("/")
+            if parts == ["api", "health"]:
+                self._json(200, {"ok": True, "version": APP_VERSION})
+                return
             if len(parts) == 3 and parts[:2] == ["api", "jobs"]:
                 job_id = parts[2]
                 with JOBS_LOCK:
@@ -199,6 +208,10 @@ def _make_handler(token: str):
                         self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(output_name)}")
                         self.send_header("Cache-Control", "no-store")
                         self.send_header("X-Content-Type-Options", "nosniff")
+                        if self.headers.get("Origin") == PAGES_ORIGIN:
+                            self.send_header("Access-Control-Allow-Origin", PAGES_ORIGIN)
+                            self.send_header("Access-Control-Allow-Private-Network", "true")
+                            self.send_header("Vary", "Origin")
                         self.end_headers()
                         with output_path.open("rb") as handle:
                             shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
@@ -206,6 +219,21 @@ def _make_handler(token: str):
                         return
                     return
             self._json(404, {"error": "not found"})
+
+        def do_OPTIONS(self) -> None:
+            route = self._authorized_path()
+            if route is None or self.headers.get("Origin") != PAGES_ORIGIN:
+                self._json(403, {"error": "origin not allowed"})
+                return
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", PAGES_ORIGIN)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-File-Name")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("Vary", "Origin")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def do_POST(self) -> None:
             route = self._authorized_path()
