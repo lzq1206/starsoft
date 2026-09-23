@@ -283,28 +283,29 @@ def _soften_stars(
     records: list[dict[str, float]] = []
     scale_x = out_w / det_w
     scale_y = out_h / det_h
-    prepared: list[tuple[Star, float, float, np.ndarray]] = []
+    prepared: list[tuple[Star, float, float, np.ndarray, np.ndarray]] = []
     for star in stars:
         cx = (star.x + 0.5) * scale_x - 0.5
         cy = (star.y + 0.5) * scale_y - 0.5
-        center_x = int(round(cx))
-        center_y = int(round(cy))
+        center_x = int(np.clip(round(cx), 0, out_w - 1))
+        center_y = int(np.clip(round(cy), 0, out_h - 1))
         core = linear_rgb[
             max(0, center_y - 2) : min(out_h, center_y + 3),
             max(0, center_x - 2) : min(out_w, center_x + 3),
             :,
         ]
-        color_peak = np.quantile(core.reshape(-1, 3), 0.9, axis=0)
-        prepared.append((star, cx, cy, color_peak))
+        color_peak = np.max(core.reshape(-1, 3), axis=0)
+        center_rgb = linear_rgb[center_y, center_x, :].copy()
+        prepared.append((star, cx, cy, color_peak, center_rgb))
 
     for index, position in enumerate(order):
-        star, cx, cy, color_peak = prepared[int(position)]
+        star, cx, cy, color_peak, center_rgb = prepared[int(position)]
         brightness = float(levels[int(position)]) ** 0.85
         radius = float(min_radius + brightness * (max_radius - min_radius))
         sigma = max(radius / 3.0, 0.65)
         extent = max(2, int(math.ceil(3.0 * sigma)))
-        center_x = int(round(cx))
-        center_y = int(round(cy))
+        center_x = int(np.clip(round(cx), 0, out_w - 1))
+        center_y = int(np.clip(round(cy), 0, out_h - 1))
         x0 = max(0, center_x - extent)
         x1 = min(out_w, center_x + extent + 1)
         y0 = max(0, center_y - extent)
@@ -312,19 +313,20 @@ def _soften_stars(
         if x1 <= x0 or y1 <= y0:
             continue
 
-        # Keep the original star image as the sharp base layer. The halo is a
-        # per-source Gaussian PSF kernel whose center peaks and whose wings
-        # fall smoothly toward zero; its amplitude follows measured source flux.
+        # The Gaussian profile is a separate light layer. Lighten compositing
+        # keeps brighter source pixels exactly as captured, including the core,
+        # while the wider Gaussian wings replace darker surrounding pixels.
         peak = float(np.max(color_peak))
         if peak > 0:
-            color = color_peak / peak
             yy, xx = np.ogrid[y0:y1, x0:x1]
             distance2 = (xx - cx) ** 2 + (yy - cy) ** 2
             gaussian = np.exp(-0.5 * distance2 / (sigma * sigma)).astype(np.float32)
-            halo_scale = float(np.clip(0.06 + 0.18 * brightness, 0.0, 0.24)) * strength
-            linear_rgb[y0:y1, x0:x1, :] += (
-                gaussian[..., None] * (peak * halo_scale * color.astype(np.float32))[None, None, :]
-            )
+            halo_scale = float(np.clip(0.55 + 0.35 * brightness, 0.0, 0.9)) * strength
+            # Ensure the Gaussian layer cannot lift the centroid pixel itself.
+            halo_peak = np.minimum(color_peak, center_rgb / max(halo_scale, 1e-8)) * halo_scale
+            halo = gaussian[..., None] * halo_peak.astype(np.float32)[None, None, :]
+            patch = linear_rgb[y0:y1, x0:x1, :]
+            np.maximum(patch, halo, out=patch)
             records.append(
                 {
                     "x_px": round(float(cx), 2),
@@ -336,6 +338,13 @@ def _soften_stars(
             )
         if progress and (index == len(order) - 1 or index % max(1, len(order) // 20) == 0):
             progress(65 + int(25 * (index + 1) / len(order)), f"正在生成逐星 Gaussian 光晕… {index + 1}/{len(order)}")
+
+    # Preserve every measured centroid sample exactly, including where two
+    # neighboring Gaussian layers overlap.
+    for _star, cx, cy, _color_peak, center_rgb in prepared:
+        center_x = int(np.clip(round(cx), 0, out_w - 1))
+        center_y = int(np.clip(round(cy), 0, out_h - 1))
+        linear_rgb[center_y, center_x, :] = center_rgb
     return records
 
 
@@ -423,7 +432,7 @@ def process_raw(
         "detected_stars": len(stars),
         "point_source_candidates": candidate_count,
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
-        "soft_focus": "additive Gaussian PSF halo, sigma=radius/3, original sharp image retained",
+        "soft_focus": "Gaussian PSF layer, Lighten blend, sigma=radius/3, original bright core retained",
         "star_photometry_and_halo_parameters": star_measurements,
         "encoding": "sRGB transfer, 16-bit RGB",
     }

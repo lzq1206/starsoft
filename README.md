@@ -1,6 +1,6 @@
 # 星点柔焦
 
-Windows RAW 星点处理工具：使用 SEP 检测点源并测量亮度，为最亮的 50 颗星分别生成 Gaussian 光晕，输出全分辨率 16 位 RGB TIFF。原始星像保留为清晰底图，光晕叠加在周围；每颗星的测光值与半径写入 TIFF 元数据。
+Windows RAW 星点处理工具：使用 SEP 检测点源并测量亮度，为最亮的 50 颗星分别生成 Gaussian 光晕，输出全分辨率 16 位 RGB TIFF。原始星像保留为清晰底图，Gaussian 光晕层使用 Lighten 合成；每颗星的测光值与半径写入 TIFF 元数据。
 
 ## 使用
 
@@ -28,10 +28,11 @@ Windows RAW 星点处理工具：使用 SEP 检测点源并测量亮度，为最
 F_i = 第 i 颗星的圆孔径通量
 R_i = r_min + (r_max - r_min) × clamp((log10(F_i) - P10) / (P99 - P10), 0, 1)^0.85
 σ_i = R_i / 3
-I_out = clamp(I_RAW + strength × Σ A_i exp(-r_i² / (2σ_i²)), 0, 1)
+G_i = A_i exp(-r_i² / (2σ_i²))
+I_out = max(I_RAW, G_1, G_2, ..., G_n)  （逐颜色通道）
 ```
 
-`A_i` 按该星局部线性 RGB 峰值和相对通量确定。Gaussian 在中心最强，向外平滑递减，在设置半径（3σ）处约为峰值的 1.1%。清晰底图保留，所以星核不会像直接模糊那样被抹开；叠加光晕会增加输出亮度，因此这是摄影观感效果，不是守恒光通量的科学 PSF 重建。
+`A_i` 来自局部线性 RGB 峰值、相对通量和柔焦强度，并受限于该星中心像素亮度。Gaussian 在中心最强，向外平滑递减，在设置半径（3σ）处约为峰值的 1.1%。Lighten 合成逐通道选择底图和 Gaussian 层中较亮的值；中心峰值像素原样保留，外围较暗像素由宽 Gaussian 翼接续，因此星核细节不会被直接模糊。该效果用于摄影柔焦，不是守恒光通量的科学 PSF 重建。
 
 每颗被处理星的底图坐标、孔径通量、由二阶矩换算的 Gaussian FWHM 近似值和光晕半径作为 `star_photometry_and_halo_parameters` 写入 TIFF 描述元数据，供后续核对。RAW 方向标记按 rawpy / LibRaw 的 flip 规则应用到检测图，使检测坐标和显影图坐标对齐。
 
@@ -56,6 +57,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 - [SEP 文档：背景、源提取和孔径测光](https://sep.readthedocs.io/en/stable/tutorial.html) 与 [API](https://sep.readthedocs.io/en/stable/reference.html)：`Background`、`extract`、`sum_circle`。
 - [SEP matched filter 文档](https://sep.readthedocs.io/en/stable/filter.html)：检测点源时可用与 PSF 形状接近的核；噪声空间变化时 matched-filter 会逐像素处理误差。
+- [Adobe Photoshop Lighten 混合模式](https://helpx.adobe.com/photoshop/desktop/repair-retouch/adjust-light-tone/blending-mode-descriptions.html)：逐颜色通道选择底图与混合层中较亮的值，用于保留亮星核心并显现更宽的 Gaussian 光晕层。
 - [Trujillo et al., The effects of seeing on Sersic profiles II: The Moffat PSF](https://arxiv.org/abs/astro-ph/0109067)：讨论 Moffat 与 Gaussian PSF 近似的关系及大气视宁度下的 PSF。
 - [Unreal Engine Bloom Convolution 文档](https://dev.epicgames.com/documentation/unreal-engine/bloom-in-unreal-engine)：用光学散射 / 衍射核与图像卷积生成 bloom，并说明添加式标准 bloom 与能量守恒卷积的差异。
 - [Astrometry.net 程序说明](https://astrometry.net/doc/readme.html) 与 [Nova 服务部署说明](https://astrometry.net/doc/nova.html)：源位置表、`solve-field` 图样匹配及本地 Nova 服务组成。
