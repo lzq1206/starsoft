@@ -91,7 +91,7 @@ def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str,
             stars=result.star_count,
             candidates=result.candidate_count,
             selectedCount=result.selected_count,
-            requestedStarCount=result.star_count_limit,
+            relativeBrightnessFloor=round(result.relative_brightness_floor * 100.0, 1),
             width=result.width,
             height=result.height,
             inputKind=result.input_kind,
@@ -243,7 +243,7 @@ def _make_handler(token: str):
                     "sensitivity": float(query.get("sensitivity", ["4.8"])[0]),
                     "strength": float(query.get("strength", ["10"])[0]),
                     "opacity": float(query.get("opacity", ["30"])[0]),
-                    "star_count_limit": int(float(query.get("star_count_limit", ["200"])[0])),
+                    "relative_brightness_floor": float(query.get("relative_brightness_floor", ["0.063"])[0]),
                     "min_radius": float(query.get("min_radius", ["3"])[0]),
                     "max_radius": float(query.get("max_radius", ["42"])[0]),
                 }
@@ -253,7 +253,7 @@ def _make_handler(token: str):
             params["sensitivity"] = min(max(params["sensitivity"], 2.0), 10.0)
             params["strength"] = min(max(params["strength"], 0.0), 30.0)
             params["opacity"] = min(max(params["opacity"], 0.0), 100.0)
-            params["star_count_limit"] = min(max(params["star_count_limit"], 0), 500)
+            params["relative_brightness_floor"] = min(max(params["relative_brightness_floor"], 0.001), 1.0)
             params["min_radius"] = min(max(params["min_radius"], 2.0), 24.0)
             params["max_radius"] = min(max(params["max_radius"], 8.0), 80.0)
             if params["max_radius"] < params["min_radius"]:

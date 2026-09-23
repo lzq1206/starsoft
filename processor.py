@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import xml.etree.ElementTree as ET
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ import numpy as np
 import rawpy
 import sep
 import tifffile
-from PIL import ExifTags, Image, ImageCms, ImageOps
+from PIL import ExifTags, Image, ImageCms, ImageFilter, ImageOps
 
 from version import APP_VERSION
 
@@ -61,6 +62,7 @@ class Star:
     b: float = 1.0
     theta: float = 0.0
     signal_to_noise: float = 0.0
+    crowded_field: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,7 +71,7 @@ class ProcessResult:
     star_count: int
     candidate_count: int
     selected_count: int
-    star_count_limit: int
+    relative_brightness_floor: float
     width: int
     height: int
     camera: str
@@ -177,14 +179,214 @@ def _linear_rgb_luminance_median(rgb: np.ndarray) -> float:
     return float(np.median(luminance))
 
 
-def _preview_exposure_shift(source_median: float, preview_median: float) -> float:
-    """Return LibRaw's supported exposure multiplier that matches preview midtones."""
+def _preview_exposure_ev(source_median: float, preview_median: float) -> float:
+    """Return the linear exposure adjustment needed to match preview midtones."""
     if not math.isfinite(source_median) or not math.isfinite(preview_median):
-        return 1.0
+        return 0.0
     if source_median <= 1e-8 or preview_median <= 1e-8:
-        return 1.0
-    # LibRaw's exp_shift range is 0.25 (−2 EV) through 8 (＋3 EV).
-    return float(np.clip(preview_median / source_median, 0.25, 8.0))
+        return 0.0
+    return math.log2(preview_median / source_median)
+
+
+def _read_xmp_exposure_ev(raw_path: Path) -> float | None:
+    """Read Adobe Camera Raw's per-image Exposure2012 value from its sidecar."""
+    xmp_path = raw_path.with_suffix(".xmp")
+    if not xmp_path.is_file():
+        xmp_path = raw_path.with_suffix(".XMP")
+    if not xmp_path.is_file():
+        return None
+    try:
+        root = ET.parse(xmp_path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+
+    exposure_tag = "{http://ns.adobe.com/camera-raw-settings/1.0/}Exposure2012"
+    for description in root.iter("{http://www.w3.org/1999/02/22-rdf-syntax-ns#}Description"):
+        raw_value = description.attrib.get(exposure_tag)
+        if raw_value is None:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _raw_exposure_shift(preview_ev: float, xmp_ev: float | None) -> float:
+    """Combine preview matching and Camera Raw exposure within LibRaw's range."""
+    total_ev = preview_ev + (xmp_ev if xmp_ev is not None else 0.0)
+    # LibRaw supports exp_shift from 0.25 (−2 EV) through 8 (+3 EV).
+    return float(2.0 ** np.clip(total_ev, -2.0, 3.0))
+
+
+def _acr_reference_luminance_median(raw_path: Path) -> tuple[float | None, str | None]:
+    """Read a same-stem Adobe Camera Raw TIFF as an optional brightness reference."""
+    reference_path = next(
+        (candidate for suffix in (".tif", ".tiff", ".TIF", ".TIFF")
+         if (candidate := raw_path.with_suffix(suffix)).is_file()),
+        None,
+    )
+    if reference_path is None:
+        return None, None
+    try:
+        with tifffile.TiffFile(reference_path) as tiff:
+            page = tiff.pages[0]
+            software_tag = page.tags.get("Software")
+            software = str(software_tag.value if software_tag else "").lower()
+            if "adobe" not in software or "camera raw" not in software:
+                return None, None
+            height, width = page.shape[:2]
+            step = max(1, int(math.ceil(math.sqrt((height * width) / 500_000))))
+            pixels = tifffile.memmap(reference_path, mode="r")[::step, ::step]
+            if pixels.ndim == 2:
+                encoded = np.repeat(pixels[..., None], 3, axis=2).astype(np.float32) / 65535.0
+            elif pixels.ndim == 3 and pixels.shape[2] >= 3:
+                encoded = pixels[..., :3].astype(np.float32) / 65535.0
+            else:
+                return None, None
+            profile_tag = page.tags.get("InterColorProfile") or page.tags.get("ICCProfile")
+            profile = bytes(profile_tag.value) if profile_tag else None
+    except (OSError, ValueError, tifffile.TiffFileError):
+        return None, None
+
+    if profile:
+        try:
+            source_profile = ImageCms.ImageCmsProfile(BytesIO(profile))
+            profile_description = ImageCms.getProfileDescription(source_profile).lower()
+            if "srgb" not in profile_description:
+                encoded8 = Image.fromarray(np.rint(np.clip(encoded, 0.0, 1.0) * 255.0).astype(np.uint8), "RGB")
+                srgb8 = ImageCms.profileToProfile(
+                    encoded8,
+                    source_profile,
+                    ImageCms.createProfile("sRGB"),
+                    outputMode="RGB",
+                )
+                encoded = np.asarray(srgb8, dtype=np.float32) / 255.0
+        except Exception:
+            # A malformed profile must not prevent RAW processing. Camera Raw TIFF
+            # files without a readable profile are interpreted as sRGB below.
+            pass
+    low = encoded <= 0.04045
+    encoded[low] /= 12.92
+    encoded[~low] = np.power((encoded[~low] + 0.055) / 1.055, 2.4)
+    luminance = encoded @ np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    return float(np.median(luminance)), reference_path.name
+
+
+def _sky_detection_mask(
+    reference: Image.Image | np.ndarray,
+    target_shape: tuple[int, int],
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Mask ground and dark foreground silhouettes using the rendered scene preview."""
+    if isinstance(reference, Image.Image):
+        image = reference.convert("RGB")
+    else:
+        values = np.asarray(reference)
+        if values.ndim == 3:
+            values = values[..., :3].astype(np.float32, copy=False) @ np.asarray(
+                [0.2126, 0.7152, 0.0722], dtype=np.float32
+            )
+        values = np.asarray(values, dtype=np.float32)
+        scale = 255.0 if values.size and float(np.nanmax(values)) <= 1.5 else 1.0
+        gray8 = np.rint(np.clip(values * scale, 0.0, 255.0)).astype(np.uint8)
+        image = Image.fromarray(gray8)
+    max_edge = 1400
+    if max(image.size) > max_edge:
+        ratio = max_edge / max(image.size)
+        image = image.resize(
+            (max(1, int(round(image.width * ratio))), max(1, int(round(image.height * ratio)))),
+            Image.Resampling.BILINEAR,
+        )
+    gray = np.asarray(ImageOps.grayscale(image), dtype=np.float32) / 255.0
+    height, width = gray.shape
+    row_profile = np.median(gray, axis=1)
+    smooth_span = max(3, int(round(height * 0.008)) | 1)
+    smooth_profile = np.convolve(
+        row_profile,
+        np.ones(smooth_span, dtype=np.float32) / smooth_span,
+        mode="same",
+    )
+    compare_span = max(4, int(round(height * 0.01)))
+    search_start = max(compare_span, int(height * 0.15))
+    search_end = min(height - compare_span, int(height * 0.94))
+    best_row = height
+    best_drop = 0.0
+    if search_end > search_start:
+        for row in range(search_start, search_end):
+            before = float(np.median(smooth_profile[row - compare_span:row]))
+            after = float(np.median(smooth_profile[row:row + compare_span]))
+            drop = before - after
+            if drop > best_drop:
+                best_row, best_drop = row, drop
+    sky_before = float(np.median(smooth_profile[max(0, best_row - compare_span):best_row])) if best_row < height else 0.0
+    horizon_found = (
+        best_row < height
+        and sky_before > 0.015
+        and best_drop >= max(0.015, sky_before * 0.28)
+    )
+    if horizon_found:
+        boundary = max(1, best_row - max(2, int(round(height * 0.006))))
+        softened = np.asarray(
+            ImageOps.grayscale(image).filter(
+                ImageFilter.GaussianBlur(radius=max(2.0, width * 0.012))
+            ),
+            dtype=np.float32,
+        ) / 255.0
+        local_sky_level = np.median(softened, axis=1)
+        local_floor = np.maximum(local_sky_level * 0.35, 0.008)
+        mask_small = (np.arange(height)[:, None] < boundary) & (softened >= local_floor[:, None])
+        # Keep the horizon cut if the silhouette threshold would remove most of
+        # the visible sky; this protects dark-sky exposures from over-masking.
+        if float(np.mean(mask_small)) < 0.15:
+            mask_small = np.broadcast_to(np.arange(height)[:, None] < boundary, gray.shape).copy()
+    else:
+        boundary = height
+        mask_small = np.ones(gray.shape, dtype=bool)
+
+    target_height, target_width = target_shape
+    mask_image = Image.fromarray((mask_small.astype(np.uint8) * 255), mode="L")
+    mask = np.asarray(
+        mask_image.resize((target_width, target_height), Image.Resampling.NEAREST),
+        dtype=np.uint8,
+    ) == 0
+    sky_fraction = float(np.mean(~mask))
+    return mask, {
+        "method": "preview horizon profile and low-pass foreground silhouette mask" if horizon_found else "full frame; no reliable horizon transition",
+        "horizon_detected": bool(horizon_found),
+        "horizon_fraction": round(boundary / max(height, 1), 5),
+        "sky_fraction": round(sky_fraction, 5),
+    }
+
+
+def _nearby_compact_source_counts(
+    source_x: np.ndarray,
+    source_y: np.ndarray,
+    target_x: np.ndarray,
+    target_y: np.ndarray,
+    radius: float,
+) -> np.ndarray:
+    """Count compact detections near each target, using a spatial hash."""
+    cell_size = max(float(radius), 1.0)
+    radius_squared = cell_size * cell_size
+    cells: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for x, y in zip(source_x, source_y):
+        key = (int(float(x) // cell_size), int(float(y) // cell_size))
+        cells.setdefault(key, []).append((float(x), float(y)))
+
+    counts = np.zeros(len(target_x), dtype=np.int16)
+    for index, (x, y) in enumerate(zip(target_x, target_y)):
+        cell_x = int(float(x) // cell_size)
+        cell_y = int(float(y) // cell_size)
+        count = 0
+        for offset_y in (-1, 0, 1):
+            for offset_x in (-1, 0, 1):
+                for point_x, point_y in cells.get((cell_x + offset_x, cell_y + offset_y), ()):
+                    if (point_x - x) ** 2 + (point_y - y) ** 2 <= radius_squared:
+                        count += 1
+        counts[index] = min(count, np.iinfo(np.int16).max)
+    return counts
 
 
 def _detector_image(raw: rawpy.RawPy) -> tuple[np.ndarray, int]:
@@ -438,11 +640,16 @@ def _read_raster(path: Path) -> RasterInput:
 def detect_stars(
     detector: np.ndarray,
     sensitivity: float,
-    star_count_limit: int = 200,
+    relative_brightness_floor: float = 0.063,
+    detection_mask: np.ndarray | None = None,
 ) -> tuple[list[Star], int, int, float]:
-    """Return the requested number of brightest SEP point sources."""
+    """Return SEP point sources above a relative aperture-flux threshold."""
     data = np.ascontiguousarray(detector, dtype=np.float32)
-    background = sep.Background(data, bw=64, bh=64, fw=3, fh=3)
+    mask = np.ascontiguousarray(detection_mask, dtype=bool) if detection_mask is not None else None
+    if mask is not None and mask.shape != data.shape:
+        raise ValueError("星空遮罩尺寸与星点检测图像不一致。")
+    relative_brightness_floor = float(np.clip(relative_brightness_floor, 0.001, 1.0))
+    background = sep.Background(data, mask=mask, bw=64, bh=64, fw=3, fh=3)
     global_sky = float(np.clip(background.globalback, 0.0, 1.0))
     signal = np.ascontiguousarray(data - background.back(), dtype=np.float32)
     noise = np.ascontiguousarray(background.rms(), dtype=np.float32)
@@ -450,6 +657,7 @@ def detect_stars(
         signal,
         float(sensitivity),
         err=noise,
+        mask=mask,
         minarea=4,
         deblend_nthresh=32,
         deblend_cont=0.005,
@@ -465,7 +673,7 @@ def detect_stars(
     first_noise = background.rms()
     global_rms = max(float(background.globalrms), 1e-12)
     first_good = (
-        (first_pass["flag"] == 0)
+        ((first_pass["flag"] & (sep.OBJ_TRUNC | sep.OBJ_SINGU)) == 0)
         & (first_roundness >= 0.68)
         & (first_size >= 0.45)
         & (first_size <= 4.5)
@@ -491,6 +699,7 @@ def detect_stars(
         signal,
         float(sensitivity),
         err=noise,
+        mask=mask,
         minarea=4,
         filter_kernel=kernel,
         filter_type="matched",
@@ -510,9 +719,25 @@ def detect_stars(
     object_x = np.clip(np.rint(objects["x"]).astype(np.int64), 0, data.shape[1] - 1)
     object_y = np.clip(np.rint(objects["y"]).astype(np.int64), 0, data.shape[0] - 1)
     local_noise = np.asarray([
-        np.median(first_noise[max(0, y - 4):min(data.shape[0], y + 5), max(0, x - 4):min(data.shape[1], x + 5)])
+        np.median(
+            first_noise[max(0, y - 4):min(data.shape[0], y + 5), max(0, x - 4):min(data.shape[1], x + 5)]
+            if mask is None
+            else first_noise[max(0, y - 4):min(data.shape[0], y + 5), max(0, x - 4):min(data.shape[1], x + 5)][
+                ~mask[max(0, y - 4):min(data.shape[0], y + 5), max(0, x - 4):min(data.shape[1], x + 5)]
+            ]
+        )
+        if mask is None or np.any(~mask[max(0, y - 4):min(data.shape[0], y + 5), max(0, x - 4):min(data.shape[1], x + 5)])
+        else global_rms
         for x, y in zip(object_x, object_y)
     ], dtype=np.float32)
+    compact_x = first_pass["x"][first_good]
+    compact_y = first_pass["y"][first_good]
+    crowding_radius = max(16.0, 6.0 * psf_sigma)
+    nearby_compact = _nearby_compact_source_counts(
+        compact_x, compact_y, objects["x"], objects["y"], crowding_radius
+    )
+    crowded_stellar_field = nearby_compact >= 4
+    elevated_local_noise = local_noise > 4.0 * global_rms
     point_source = (
         np.isfinite(objects["x"])
         & np.isfinite(objects["y"])
@@ -522,7 +747,7 @@ def detect_stars(
         & (minor >= 0.45)
         & (major <= min(6.0, max(3.5, 2.25 * psf_sigma)))
         & (roundness >= 0.68)
-        & (local_noise <= 4.0 * global_rms)
+        & (~elevated_local_noise | crowded_stellar_field)
         & ~bad_flags
     )
     indices = np.flatnonzero(point_source)
@@ -539,6 +764,7 @@ def detect_stars(
         objects["y"][indices],
         aperture_radius,
         err=noise,
+        mask=mask,
         subpix=5,
     )
     good = (
@@ -558,8 +784,13 @@ def detect_stars(
     candidate_count = int(len(indices))
     brightest_flux = float(np.max(flux))
     relative_flux = flux / max(brightest_flux, 1e-20)
+    eligible = relative_flux >= relative_brightness_floor
+    eligible_indices = np.flatnonzero(eligible)
+    selected_count = int(len(eligible_indices))
+    if selected_count == 0:
+        return [], candidate_count, 0, global_sky
     signal_to_noise = flux / np.maximum(flux_error, 1e-20)
-    order = np.argsort(flux)[::-1][: int(np.clip(star_count_limit, 0, 500))]
+    order = eligible_indices[np.argsort(flux[eligible_indices])[::-1]]
     stars = [
         Star(
             float(objects["x"][indices[i]]),
@@ -572,10 +803,11 @@ def detect_stars(
             float(objects["b"][indices[i]]),
             float(objects["theta"][indices[i]]),
             float(signal_to_noise[i]),
+            bool(elevated_local_noise[indices[i]] and crowded_stellar_field[indices[i]]),
         )
         for i in order
     ]
-    return stars, candidate_count, len(stars), global_sky
+    return stars, candidate_count, selected_count, global_sky
 
 
 def _soften_stars(
@@ -729,13 +961,15 @@ def _soften_stars(
         circular_mask = mask_t * mask_t * (3.0 - 2.0 * mask_t)
         halo_peak = np.asarray(item["amplitude"])
         halo = np.asarray(item["background"])[None, None, :] + (
-            gaussian * circular_mask
-        )[..., None] * halo_peak[None, None, :]
+            gaussian[..., None] * halo_peak[None, None, :]
+        )
         patch = image_data[y0:y1, x0:x1, :]
-        # Blend only the added wing over the original image; the photographed
-        # star core remains untouched and opacity is independent of halo width.
-        np.maximum(patch, halo, out=halo)
+        # Subtract the original image from the unmasked target PSF, then apply
+        # the circular feather once. This leaves all pixels outside the circle
+        # unchanged, including pixels below the local sky level.
         np.subtract(halo, patch, out=halo)
+        np.maximum(halo, 0.0, out=halo)
+        halo *= circular_mask[..., None]
         patch += halo * opacity_alpha
         records.append({
             "x_px": round(cx, 2),
@@ -779,7 +1013,7 @@ def process_raw(
     sensitivity: float = 4.8,
     strength: float = 10.0,
     opacity: float = 30.0,
-    star_count_limit: int = 200,
+    relative_brightness_floor: float = 0.063,
     min_radius: float = 3.0,
     max_radius: float = 42.0,
     progress: Progress | None = None,
@@ -793,7 +1027,7 @@ def process_raw(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if max_radius < min_radius:
         min_radius, max_radius = max_radius, min_radius
-    star_count_limit = int(np.clip(star_count_limit, 0, 500))
+    relative_brightness_floor = float(np.clip(relative_brightness_floor, 0.001, 1.0))
     strength = float(np.clip(strength, 0.0, 30.0))
     opacity = float(np.clip(opacity, 0.0, 100.0))
 
@@ -804,15 +1038,24 @@ def process_raw(
     report(2, "正在读取图像与镜头信息…")
     raw_preview_median: float | None = None
     raw_linear_median: float | None = None
+    raw_preview_ev = 0.0
+    raw_xmp_exposure_ev: float | None = None
     raw_exposure_shift = 1.0
+    raw_acr_reference_median: float | None = None
+    raw_acr_reference_name: str | None = None
+    raw_brightness_calibration_method = "no calibration reference available"
+    sky_mask_info: dict[str, object] = {}
     if input_path.suffix.lower() in {".tif", ".tiff", ".jpg", ".jpeg"}:
         raster = _read_raster(input_path)
         info = raster.info
         if metadata_callback:
             metadata_callback(info)
         detector, _factor = _raster_detector_image(raster.pixels, info.focal_length)
+        sky_mask, sky_mask_info = _sky_detection_mask(raster.pixels, detector.shape)
         report(12, "正在识别星点与测量亮度…")
-        stars, candidate_count, selected_count, sky_background_level = detect_stars(detector, sensitivity, star_count_limit)
+        stars, candidate_count, selected_count, sky_background_level = detect_stars(
+            detector, sensitivity, relative_brightness_floor, sky_mask
+        )
         image_data = raster.pixels
         profile = raster.profile
         profile_description = raster.profile_description
@@ -830,7 +1073,7 @@ def process_raw(
             if raster.linear_srgb
             else "native source channel encoding retained; original ICC profile bytes preserved"
         )
-        report(36, f"SEP 找到 {candidate_count:,} 个点源，选取最亮的 {selected_count:,} 个，开始柔焦…")
+        report(36, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个达到相对亮度门限，开始柔焦…")
     else:
         raw_extensions = {
             ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".sr2", ".srf", ".dng",
@@ -840,19 +1083,29 @@ def process_raw(
         if input_path.suffix.lower() not in raw_extensions:
             raise ValueError("请选择相机 RAW、TIFF 或 JPG 文件。")
         with rawpy.imread(str(input_path)) as raw:
+            raw_xmp_exposure_ev = _read_xmp_exposure_ev(input_path)
             preview = _extract_raw_preview(raw)
             info = _raw_info(raw, preview)
             if metadata_callback:
                 metadata_callback(info)
             detector, _factor = _detector_image(raw)
+            sky_mask, sky_mask_info = _sky_detection_mask(
+                preview if preview is not None else detector, detector.shape
+            )
             report(12, "正在识别星点与测量亮度…")
-            stars, candidate_count, selected_count, sky_background_level = detect_stars(detector, sensitivity, star_count_limit)
+            stars, candidate_count, selected_count, sky_background_level = detect_stars(
+                detector, sensitivity, relative_brightness_floor, sky_mask
+            )
+            raw_acr_reference_median, raw_acr_reference_name = _acr_reference_luminance_median(input_path)
             if preview is not None:
                 raw_preview_median = _preview_linear_luminance_median(preview)
-                report(36, "正在按相机内嵌预览校准 RAW 曝光…")
+            if preview is not None or raw_acr_reference_median is not None:
+                report(36, "正在校准 RAW 曝光与同名参考图…")
                 calibration_rgb = raw.postprocess(
                     gamma=(1, 1),
                     no_auto_bright=True,
+                    exp_shift=1.0,
+                    exp_preserve_highlights=0.0,
                     output_bps=16,
                     output_color=rawpy.ColorSpace.sRGB,
                     use_camera_wb=True,
@@ -863,10 +1116,27 @@ def process_raw(
                 np.divide(calibration_float, 65535.0, out=calibration_float)
                 raw_linear_median = _linear_rgb_luminance_median(calibration_float)
                 del calibration_rgb, calibration_float
-                raw_exposure_shift = _preview_exposure_shift(
+            if preview is not None and raw_linear_median is not None:
+                raw_preview_ev = _preview_exposure_ev(
                     raw_linear_median, raw_preview_median
                 )
-            report(43, f"SEP 找到 {candidate_count:,} 个点源，选取最亮的 {selected_count:,} 个，正在解码 RAW…")
+            raw_exposure_shift = _raw_exposure_shift(
+                raw_preview_ev, raw_xmp_exposure_ev
+            )
+            if raw_acr_reference_median is not None and raw_linear_median is not None and raw_linear_median > 1e-8:
+                # A same-stem Adobe Camera Raw TIFF has already rendered the
+                # sidecar settings through Adobe's profile and tone pipeline.
+                # Match its scene median directly instead of stacking XMP EV a
+                # second time on top of the embedded camera JPEG.
+                raw_exposure_shift = float(np.clip(
+                    raw_acr_reference_median / raw_linear_median, 0.25, 8.0
+                ))
+                raw_brightness_calibration_method = "same-stem Adobe Camera Raw TIFF median; XMP exposure already reflected in reference"
+            elif preview is not None:
+                raw_brightness_calibration_method = "embedded preview median combined with XMP Exposure2012 when present"
+            elif raw_xmp_exposure_ev is not None:
+                raw_brightness_calibration_method = "XMP Exposure2012 only; no embedded preview or Adobe TIFF reference"
+            report(43, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个达到亮度门限，正在解码 RAW…")
             rgb = raw.postprocess(
                 gamma=(1, 1),
                 no_auto_bright=True,
@@ -890,7 +1160,7 @@ def process_raw(
         invert_gray = False
         photometric = tifffile.PHOTOMETRIC.RGB
         input_kind = "RAW"
-        encoding = "RAW developed to linear sRGB with embedded-preview median exposure matching and highlight preservation; sRGB ICC profile embedded"
+        encoding = "RAW developed to linear sRGB with XMP/preview or matching Adobe Camera Raw TIFF exposure calibration and highlight preservation; sRGB ICC profile embedded"
 
     report(63, "图像解码完成，按星点亮度与 PSF 形状柔化…")
     star_measurements = _soften_stars(
@@ -926,10 +1196,11 @@ def process_raw(
         "aperture": info.aperture,
         "detected_stars": len(stars),
         "point_source_candidates": candidate_count,
-        "requested_brightest_star_count": star_count_limit,
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
-        "star_selection": "top N by SEP circular aperture flux; no catalog magnitude calibration",
-        "soft_focus": "circular isotropic Gaussian wings with circular smoothstep feather mask; blend wing opacity over original pixels while retaining original star cores",
+        "star_selection": "all SEP point sources above the selected relative aperture-flux ratio; instrumental brightness, not catalog apparent magnitude",
+        "relative_brightness_floor_flux_ratio": relative_brightness_floor,
+        "relative_magnitude_difference_definition": "delta_magnitude=-2.5*log10(flux_ratio), relative to the brightest point source in the detected sky area",
+        "soft_focus": "circular isotropic Gaussian wings with circular smoothstep feather mask; only the positive difference from the target halo profile is blended, leaving pixels outside the circular mask unchanged",
         "brightness_to_radius_curve": "linear response to relative stellar magnitude: log(aperture_flux/faintest_selected_flux) normalized to brightest selected star, matching 18ffa10 mapping",
         "brightness_to_halo_strength_curve": "halo peak scales linearly with SEP aperture-flux ratio to the brightest selected star; faint stars receive smaller halos as well as smaller radii",
         "soft_focus_strength": round(strength, 1),
@@ -940,14 +1211,22 @@ def process_raw(
         "sky_reference_level": REFERENCE_SKY_LEVEL,
         "sky_adaptation_gain": round(float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)), 4),
         "sky_adaptation": "SEP global background; halo wing amplitude scaled in proportion to background luminance with a 0.70x–1.50x clamp (Weber contrast adaptation)",
-        "source_rejection": "SEP PSF matched detection; reject sources with nonstellar roundness, excessive size relative to estimated PSF, or local RMS above 4x image global RMS",
+        "source_rejection": "sky-region mask; SEP PSF matched detection; reject sources with nonstellar roundness, excessive size relative to estimated PSF, or local RMS above 4x sky-only global RMS except compact sources in dense stellar fields",
         "star_photometry_and_halo_parameters": star_measurements,
+        "crowded_stellar_field_sources": sum(star.crowded_field for star in stars),
+        "crowded_stellar_field_rule": "allow compact, round PSF detections above the local RMS threshold only when at least four compact detections lie within max(16 detector pixels, 6 x estimated PSF sigma); extended diffuse structure remains rejected",
+        "sky_region": sky_mask_info,
         "encoding": encoding,
         "input_color_profile": profile_description,
         "raw_preview_available": input_kind == "RAW" and info.preview is not None,
         "raw_embedded_preview_median_luminance_linear": round(raw_preview_median, 7) if raw_preview_median is not None else None,
         "raw_unadjusted_median_luminance_linear": round(raw_linear_median, 7) if raw_linear_median is not None else None,
-        "raw_exposure_shift_from_embedded_preview": round(raw_exposure_shift, 5) if input_kind == "RAW" else None,
+        "raw_preview_exposure_ev": round(raw_preview_ev, 5) if input_kind == "RAW" else None,
+        "raw_xmp_exposure_ev": round(raw_xmp_exposure_ev, 5) if raw_xmp_exposure_ev is not None else None,
+        "raw_acr_reference_tiff": raw_acr_reference_name if input_kind == "RAW" else None,
+        "raw_acr_reference_median_luminance_linear": round(raw_acr_reference_median, 7) if raw_acr_reference_median is not None else None,
+        "raw_brightness_calibration_method": raw_brightness_calibration_method if input_kind == "RAW" else None,
+        "raw_final_exposure_shift": round(raw_exposure_shift, 5) if input_kind == "RAW" else None,
     }
     temporary = output_path.with_name(output_path.stem + ".writing" + output_path.suffix)
     try:
@@ -977,7 +1256,7 @@ def process_raw(
         star_count=len(stars),
         candidate_count=candidate_count,
         selected_count=selected_count,
-        star_count_limit=star_count_limit,
+        relative_brightness_floor=relative_brightness_floor,
         width=int(pixels16.shape[1]),
         height=int(pixels16.shape[0]),
         camera=info.camera,
