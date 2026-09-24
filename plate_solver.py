@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,9 @@ class SolverTile:
     y1: int
     wcs: WCS
     pixel_scale_arcsec: float
+    wide_field: bool = False
+    matched_quads: int = 0
+    total_quads: int = 0
 
 
 @dataclass(frozen=True)
@@ -185,6 +189,98 @@ def _extract_astap_wcs(path: Path, expected_scale_arcsec: float) -> WCS | None:
     return wcs
 
 
+def _astap_quad_counts(log_path: Path, stdout: str = "") -> tuple[int, int]:
+    """Read ASTAP's independent quad-match count for a candidate solution."""
+    text = stdout
+    if log_path.is_file():
+        text += "\n" + log_path.read_text(encoding="utf-8", errors="replace")
+    matches = re.findall(
+        r"\b(\d+)\s+of\s+(\d+)\s+quads?\s+selected\s+matching\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        return 0, 0
+    return tuple(map(int, matches[-1]))
+
+
+def _wide_tile_is_strong(tile: SolverTile) -> bool:
+    """A lone wide-field WCS needs more than ASTAP's minimum three quads."""
+    return (
+        tile.matched_quads >= 6
+        and tile.total_quads > 0
+        and tile.matched_quads / tile.total_quads >= 0.5
+    )
+
+
+def _wide_tiles_agree(first: SolverTile, second: SolverTile) -> bool:
+    """Check two overlapping tile solutions at several shared image points."""
+    x0, y0 = max(first.x0, second.x0), max(first.y0, second.y0)
+    x1, y1 = min(first.x1, second.x1), min(first.y1, second.y1)
+    if x1 <= x0 or y1 <= y0:
+        return False
+    overlap_area = (x1 - x0) * (y1 - y0)
+    smaller_tile_area = min(
+        (first.x1 - first.x0) * (first.y1 - first.y0),
+        (second.x1 - second.x0) * (second.y1 - second.y0),
+    )
+    if overlap_area / max(smaller_tile_area, 1) > 0.85:
+        return False
+    if (x1 - x0) < 0.15 * min(first.x1 - first.x0, second.x1 - second.x0):
+        return False
+    if (y1 - y0) < 0.15 * min(first.y1 - first.y0, second.y1 - second.y0):
+        return False
+
+    sample_x = np.linspace(x0 + 0.2 * (x1 - x0), x1 - 0.2 * (x1 - x0), 3)
+    sample_y = np.linspace(y0 + 0.2 * (y1 - y0), y1 - 0.2 * (y1 - y0), 3)
+    global_pixels = np.asarray([(x, y) for y in sample_y for x in sample_x], dtype=np.float64)
+    try:
+        first_world = np.asarray(first.wcs.all_pix2world(
+            global_pixels - np.asarray([first.x0, first.y0]), 0
+        ), dtype=np.float64)
+        second_world = np.asarray(second.wcs.all_pix2world(
+            global_pixels - np.asarray([second.x0, second.y0]), 0
+        ), dtype=np.float64)
+    except Exception:
+        return False
+    valid = (
+        np.isfinite(first_world).all(axis=1)
+        & np.isfinite(second_world).all(axis=1)
+        & (np.abs(first_world[:, 1]) <= 90.0)
+        & (np.abs(second_world[:, 1]) <= 90.0)
+    )
+    if np.count_nonzero(valid) < 5:
+        return False
+
+    def unit_vectors(world: np.ndarray) -> np.ndarray:
+        ra = np.radians(world[:, 0])
+        dec = np.radians(world[:, 1])
+        cos_dec = np.cos(dec)
+        return np.column_stack((cos_dec * np.cos(ra), cos_dec * np.sin(ra), np.sin(dec)))
+
+    first_vectors = unit_vectors(first_world[valid])
+    second_vectors = unit_vectors(second_world[valid])
+    cos_separation = np.clip(np.sum(first_vectors * second_vectors, axis=1), -1.0, 1.0)
+    separation_arcsec = np.degrees(np.arccos(cos_separation)) * 3600.0
+    tolerance_arcsec = max(
+        120.0,
+        10.0 * max(first.pixel_scale_arcsec, second.pixel_scale_arcsec),
+    )
+    return float(np.percentile(separation_arcsec, 90)) <= tolerance_arcsec
+
+
+def _trusted_wide_tiles(candidates: Sequence[SolverTile]) -> list[SolverTile]:
+    """Keep strong single-tile solves and weak solves confirmed in overlaps."""
+    trusted = {index for index, tile in enumerate(candidates) if _wide_tile_is_strong(tile)}
+    for first_index, first in enumerate(candidates):
+        for second_index in range(first_index + 1, len(candidates)):
+            second = candidates[second_index]
+            if _wide_tiles_agree(first, second):
+                trusted.add(first_index)
+                trusted.add(second_index)
+    return [tile for index, tile in enumerate(candidates) if index in trusted]
+
+
 def _solver_image(detector: np.ndarray, mask: np.ndarray | None, crop: tuple[int, int, int, int]) -> np.ndarray:
     x0, y0, x1, y1 = crop
     tile = np.asarray(detector[y0:y1, x0:x1], dtype=np.float32).copy()
@@ -254,12 +350,14 @@ def _positions_to_sky(
             if length <= tile:
                 return [0]
             last = length - tile
-            stride = max(1, int(tile * 0.68))
+            # Half-tile steps keep each next tile center in the prior tile.
+            # That allows a local search seed without extrapolating its WCS.
+            stride = max(1, int(tile * 0.5))
             values = list(range(0, last + 1, stride))
             values.append(last)
             unique = sorted(set(values))
-            # Solve the four extreme areas first so the edges are covered even
-            # when an unusually wide field reaches the overall time budget.
+            # Include both edges explicitly, even when the stride misses the
+            # final tile center.
             return list(dict.fromkeys([0, last, *unique[1:-1]]))
 
         x_starts = starts(solver_width, tile_w)
@@ -272,13 +370,86 @@ def _positions_to_sky(
             if box not in boxes:
                 boxes.append(box)
 
+    detector_stars_xy = np.asarray(
+        [
+            (float(getattr(star, "x")) * detector_scale_x,
+             float(getattr(star, "y")) * detector_scale_y)
+            for star in stars
+        ],
+        dtype=np.float64,
+    ).reshape((-1, 2))
+    if len(detector_stars_xy):
+        valid_star_positions = np.isfinite(detector_stars_xy).all(axis=1)
+        valid_star_positions &= (
+            (detector_stars_xy[:, 0] >= 0)
+            & (detector_stars_xy[:, 0] < solver_width)
+            & (detector_stars_xy[:, 1] >= 0)
+            & (detector_stars_xy[:, 1] < solver_height)
+        )
+        if sky_mask is not None and sky_mask.shape == detector.shape:
+            finite_xy = np.nan_to_num(detector_stars_xy, nan=0.0, posinf=0.0, neginf=0.0)
+            star_x = np.clip(
+                np.floor(finite_xy[:, 0] / detector_scale_x).astype(np.intp),
+                0,
+                detector.shape[1] - 1,
+            )
+            star_y = np.clip(
+                np.floor(finite_xy[:, 1] / detector_scale_y).astype(np.intp),
+                0,
+                detector.shape[0] - 1,
+            )
+            valid_star_positions &= ~np.asarray(sky_mask, dtype=bool)[star_y, star_x]
+        detector_stars_xy = detector_stars_xy[valid_star_positions]
+
+    def box_priority(box: tuple[int, int, int, int]) -> float:
+        x0, y0, x1, y1 = box
+        tile_height, tile_width = y1 - y0, x1 - x0
+        if len(detector_stars_xy):
+            in_tile = (
+                (detector_stars_xy[:, 0] >= x0)
+                & (detector_stars_xy[:, 0] < x1)
+                & (detector_stars_xy[:, 1] >= y0)
+                & (detector_stars_xy[:, 1] < y1)
+            )
+            star_count = int(np.count_nonzero(in_tile))
+        else:
+            star_count = 0
+        sky_fraction = 1.0
+        if sky_mask is not None and sky_mask.shape == detector.shape:
+            dx0 = max(0, int(math.floor(x0 / detector_scale_x)))
+            dy0 = max(0, int(math.floor(y0 / detector_scale_y)))
+            dx1 = min(detector.shape[1], int(math.ceil(x1 / detector_scale_x)))
+            dy1 = min(detector.shape[0], int(math.ceil(y1 / detector_scale_y)))
+            if dx1 > dx0 and dy1 > dy0:
+                sky_fraction = float(np.mean(~np.asarray(sky_mask[dy0:dy1, dx0:dx1], dtype=bool)))
+        center_distance = math.hypot(
+            ((x0 + x1) * 0.5 - solver_width * 0.5) / max(solver_width * 0.5, 1.0),
+            ((y0 + y1) * 0.5 - solver_height * 0.5) / max(solver_height * 0.5, 1.0),
+        )
+        tile_fov_x = _axis_fov_degrees(x0, x1, solver_width, sensor_width_mm, focal_mm)
+        tile_fov_y = _axis_fov_degrees(y0, y1, solver_height, sensor_height_mm, focal_mm)
+        distortion_penalty = max(0.0, max(tile_fov_x, tile_fov_y) - 35.0) / 45.0
+        return (
+            (min(star_count, 500) + 5.0) * (0.2 + 0.8 * sky_fraction)
+            / (1.0 + 0.6 * center_distance + 0.5 * distortion_penalty)
+        )
+
+    # Start with star-rich sky near the optical axis. Full-frame blind solves
+    # are retained as candidates, but wide cropped fields generally have less
+    # distortion and solve more quickly.
+    boxes = sorted(set(boxes), key=box_priority, reverse=True)
+
     successful: list[SolverTile] = []
+    wide_candidates: list[SolverTile] = []
     diagnostics: list[str] = []
     solve_deadline = time.monotonic() + 90.0
     with tempfile.TemporaryDirectory(prefix="starsoft-solve-") as temporary:
         work_dir = Path(temporary)
-        total_attempts = len(boxes)
+        total_attempts = len(boxes) + 1
         solver_source = tifffile.memmap(solver_image_path, mode="r")
+        trial_specs: dict[
+            tuple[int, int, int, int], tuple[Path, float, bool]
+        ] = {}
         for index, (x0, y0, x1, y1) in enumerate(boxes):
             remaining_seconds = solve_deadline - time.monotonic()
             if remaining_seconds <= 0:
@@ -296,30 +467,72 @@ def _positions_to_sky(
                 continue
             expected_scale = 0.5 * (fov_x / tile_w + fov_y / tile_h) * 3600.0
             is_full_frame = (x0, y0, x1, y1) == (0, 0, solver_width, solver_height)
+            # Always use the sky-masked, grayscale proxy when a horizon mask
+            # exists; a source TIFF could otherwise put trees/buildings back
+            # into the solver image.
             image_path = (
                 primary_image_path
-                if is_full_frame and primary_image_path is not None
+                if is_full_frame and primary_image_path is not None and sky_mask is None
                 else solver_image_path
                 if is_full_frame
                 else work_dir / f"field_{index:02d}.tif"
             )
-            output_base = work_dir / f"solution_{index:02d}"
             if not is_full_frame:
                 tifffile.imwrite(
                     str(image_path), solver_source[y0:y1, x0:x1],
                     compression=None, photometric="minisblack",
                 )
             wide_field = max(fov_x, fov_y) > 20.0
-            use_distortion_fit = wide_field
+            trial_specs[(x0, y0, x1, y1)] = (image_path, expected_scale, wide_field)
+            output_base = work_dir / f"solution_{index:02d}"
             command = [
                 str(executable), "-f", str(image_path), "-fov", f"{fov_y:.5f}",
                 "-d", str(catalogs), "-z", "0",
-                "-speed", "slow" if use_distortion_fit else "auto",
-                "-s", "1500" if use_distortion_fit else "1000",
+                "-speed", "auto",
+                "-s", "500" if wide_field else "1000",
                 "-t", "0.007", "-wcs", "-sip", "-log", "-o", str(output_base),
             ]
             if wide_field:
                 command[command.index("-z"):command.index("-z")] = ["-D", "w08"]
+                tile_center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+                seed_tiles = [
+                    tile for tile in wide_candidates
+                    if _wide_tile_is_strong(tile)
+                    and tile.x0 <= tile_center[0] < tile.x1
+                    and tile.y0 <= tile_center[1] < tile.y1
+                ]
+                if seed_tiles:
+                    seed = min(
+                        seed_tiles,
+                        key=lambda tile: (
+                            (tile.x1 - tile.x0) * (tile.y1 - tile.y0)
+                        ),
+                    )
+                    try:
+                        seed_world = seed.wcs.all_pix2world([[
+                            tile_center[0] - seed.x0,
+                            tile_center[1] - seed.y0,
+                        ]], 0)[0]
+                        seed_ra = float(seed_world[0]) % 360.0
+                        seed_dec = float(seed_world[1])
+                        if math.isfinite(seed_ra) and math.isfinite(seed_dec) and -90 <= seed_dec <= 90:
+                            search_radius = max(3.0, min(15.0, fov_y * 0.25))
+                            seed_arguments = [
+                                "-ra", f"{seed_ra / 15.0:.7f}",
+                                "-spd", f"{seed_dec + 90.0:.7f}",
+                                "-r", f"{search_radius:.2f}",
+                            ]
+                            output_option = command.index("-o")
+                            command[output_option:output_option] = seed_arguments
+                    except Exception:
+                        pass
+
+            attempts_left = max(1, len(boxes) - index)
+            fallback_reserve = 35.0 if wide_field else 0.0
+            per_attempt_budget = max(
+                5.0,
+                min(20.0, (remaining_seconds - min(fallback_reserve, remaining_seconds * 0.5)) / attempts_left),
+            )
             try:
                 completed = subprocess.run(
                     command,
@@ -329,15 +542,29 @@ def _positions_to_sky(
                     text=True,
                     errors="replace",
                     check=False,
-                    timeout=min(30.0, remaining_seconds),
+                    timeout=min(per_attempt_budget, remaining_seconds),
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except subprocess.TimeoutExpired:
-                diagnostics.append(f"{image_path.name}: ASTAP 解算超时。")
+                diagnostics.append(f"{image_path.name}: ASTAP 快速搜索超时。")
                 continue
             solved_wcs = _extract_astap_wcs(output_base, expected_scale)
             if solved_wcs is not None:
-                successful.append(SolverTile(x0, y0, x1, y1, solved_wcs, expected_scale))
+                matched_quads, total_quads = _astap_quad_counts(
+                    output_base.with_suffix(".log"), completed.stdout
+                )
+                candidate = SolverTile(
+                    x0, y0, x1, y1, solved_wcs, expected_scale, wide_field,
+                    matched_quads, total_quads,
+                )
+                if wide_field:
+                    wide_candidates.append(candidate)
+                    if not _wide_tile_is_strong(candidate):
+                        diagnostics.append(
+                            f"{image_path.name}: 宽场候选仅匹配 {matched_quads}/{total_quads} 个四星组合，等待重叠图块确认。"
+                        )
+                else:
+                    successful.append(candidate)
             elif completed.stdout:
                 useful_lines = [
                     line.strip() for line in completed.stdout.splitlines()
@@ -349,6 +576,64 @@ def _positions_to_sky(
                     diagnostics.append(f"{image_path.name}: {' | '.join(useful_lines[-4:])}")
             if can_solve_full and successful and max(full_fov_width, full_fov_height) <= 30.0:
                 break
+
+        if wide_candidates:
+            successful.extend(_trusted_wide_tiles(wide_candidates))
+
+        has_wide_trials = any(spec[2] for spec in trial_specs.values())
+        if has_wide_trials and not _trusted_wide_tiles(wide_candidates):
+            remaining_seconds = solve_deadline - time.monotonic()
+            if progress and remaining_seconds > 0:
+                progress(53, "快速宽场搜索未得到可信结果，正在补做一次重叠搜索…")
+            fallback_box = next(
+                (box for box in boxes if box in trial_specs and trial_specs[box][2]),
+                None,
+            )
+            if remaining_seconds > 0 and fallback_box is not None:
+                x0, y0, x1, y1 = fallback_box
+                image_path, expected_scale, _wide_field = trial_specs[fallback_box]
+                output_base = work_dir / "solution_slow_fallback"
+                fov_y = _axis_fov_degrees(y0, y1, solver_height, sensor_height_mm, focal_mm)
+                command = [
+                    str(executable), "-f", str(image_path), "-fov", f"{fov_y:.5f}",
+                    "-d", str(catalogs), "-D", "w08", "-z", "0",
+                    "-speed", "slow", "-s", "500", "-t", "0.007",
+                    "-wcs", "-sip", "-log", "-o", str(output_base),
+                ]
+                try:
+                    completed = subprocess.run(
+                        command,
+                        cwd=str(work_dir),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        errors="replace",
+                        check=False,
+                        timeout=min(40.0, remaining_seconds),
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except subprocess.TimeoutExpired:
+                    diagnostics.append(f"{image_path.name}: ASTAP 慢速补充搜索超时。")
+                else:
+                    solved_wcs = _extract_astap_wcs(output_base, expected_scale)
+                    if solved_wcs is not None:
+                        matched_quads, total_quads = _astap_quad_counts(
+                            output_base.with_suffix(".log"), completed.stdout
+                        )
+                        wide_candidates.append(SolverTile(
+                            x0, y0, x1, y1, solved_wcs, expected_scale, True,
+                            matched_quads, total_quads,
+                        ))
+                    if completed.stdout:
+                        useful_lines = [
+                            line.strip() for line in completed.stdout.splitlines()
+                            if line.strip() and any(token in line.lower() for token in (
+                                "error", "fail", "no solution", "cannot", "not found", "inaccurate", "stars"
+                            ))
+                        ]
+                        if useful_lines:
+                            diagnostics.append(f"{image_path.name} 慢速补充搜索: {' | '.join(useful_lines[-4:])}")
+                    successful.extend(_trusted_wide_tiles(wide_candidates))
         solver_source._mmap.close()
 
     if not successful:
@@ -357,7 +642,7 @@ def _positions_to_sky(
             diagnostic_suffix = " ASTAP 信息：" + "；".join(diagnostics[-3:])
         raise RuntimeError(
             "本机板解算未能为这张照片取得可信 WCS，未调用 Gaia 星表，也未使用画面亮度代替星表星等。"
-            "请确认照片包含清晰星点、镜头焦距与相机型号 EXIF 完整；超广角或严重畸变照片可能需要更完整的天空视场。"
+            "宽视场结果需要足够的四星几何匹配或重叠图块互相确认。请确认照片包含清晰星点，且镜头焦距与相机型号 EXIF 完整。"
             + diagnostic_suffix
         )
 

@@ -68,4 +68,11 @@ GitHub Pages 前端由 `.github/workflows/pages.yml` 自动构建和发布。网
 - [SEP 源提取、背景与孔径测光](https://sep.readthedocs.io/en/stable/tutorial.html)、[PSF 匹配滤波](https://sep.readthedocs.io/en/stable/filter.html)
 - [SciPy 高斯滤波与二维卷积实现](https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.gaussian_filter.html)、[二维高斯卷积核定义](https://docs.astropy.org/en/latest/api/astropy.convolution.Gaussian2DKernel.html)
 - [ASTAP 命令行板解算器与 W08 星表说明](https://www.hnsky.org/astap.htm)；程序包内附完整 ASTAP MPL-2.0 许可证、上游源码链接、Gaia/ESA/DPAC 归属与数据库 acknowledgement。
+- [ASTAP 四星四边形识别说明](https://www.hnsky.org/astap_astrometric_solving.htm)、[Astrometry.net 解算尺度约束与降采样文档](https://astrometrynet.readthedocs.io/en/latest/readme.html)
 - [rawpy / LibRaw](https://github.com/LibRaw/LibRaw)、[tifffile](https://github.com/cgohlke/tifffile)、[PyInstaller](https://github.com/pyinstaller/pyinstaller)
+
+### 广角星空板解算
+
+ASTAP 通过四星几何组合匹配图像与本地星表。广角图先按天空掩码、SEP 星点数量和离画面中心的距离选择分块；分块保留 50% 重叠。程序先用 ASTAP 的 `auto` 模式和常用的 500 个候选星搜索，只有快速搜索没有可信结果时，才对最优图块补一次 `slow` 重叠搜索。邻接图块的中心落在前一块范围内时，可用前一块的 WCS 作为局部搜索位置。
+
+宽场 WCS 通过组合数和重叠区坐标一致性做二次确认：单块至少要有 6 个匹配四边形且匹配比例达到一半；较弱结果须与另一块独立解算的重叠区域一致。此门槛用于避免宽场星点稀疏时把 ASTAP 最低限度的组合匹配误当成可靠解算。ASTAP 手册将 `slow` 描述为更大的搜索重叠，并把 500 列为常用星点数；四边形构造与图块一致性门槛的依据见上游算法说明，门槛数值是本程序的结果筛选策略。
