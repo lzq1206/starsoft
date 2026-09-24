@@ -350,8 +350,8 @@ def _positions_to_sky(
             if length <= tile:
                 return [0]
             last = length - tile
-            # Half-tile steps keep each next tile center in the prior tile.
-            # That allows a local search seed without extrapolating its WCS.
+            # Half-tile steps place each next tile center at the prior tile's
+            # edge, where its WCS can still provide a local search seed.
             stride = max(1, int(tile * 0.5))
             values = list(range(0, last + 1, stride))
             values.append(last)
@@ -498,8 +498,8 @@ def _positions_to_sky(
                 seed_tiles = [
                     tile for tile in wide_candidates
                     if _wide_tile_is_strong(tile)
-                    and tile.x0 <= tile_center[0] < tile.x1
-                    and tile.y0 <= tile_center[1] < tile.y1
+                    and tile.x0 <= tile_center[0] <= tile.x1
+                    and tile.y0 <= tile_center[1] <= tile.y1
                 ]
                 if seed_tiles:
                     seed = min(
@@ -509,9 +509,19 @@ def _positions_to_sky(
                         ),
                     )
                     try:
-                        seed_world = seed.wcs.all_pix2world([[
+                        seed_pixel_x = float(np.clip(
                             tile_center[0] - seed.x0,
+                            0.0,
+                            max(seed.x1 - seed.x0 - 1, 0),
+                        ))
+                        seed_pixel_y = float(np.clip(
                             tile_center[1] - seed.y0,
+                            0.0,
+                            max(seed.y1 - seed.y0 - 1, 0),
+                        ))
+                        seed_world = seed.wcs.all_pix2world([[
+                            seed_pixel_x,
+                            seed_pixel_y,
                         ]], 0)[0]
                         seed_ra = float(seed_world[0]) % 360.0
                         seed_dec = float(seed_world[1])
