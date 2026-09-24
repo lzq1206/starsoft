@@ -82,7 +82,7 @@
           <div class="track"><div id="bar" class="bar"></div></div>
           <div id="result" class="result"><span id="resultMeta" class="result-meta"></span><a id="download" class="download" href="#">下载 16 位 TIFF</a></div>
         </div>
-        <div class="footer"><span>星点柔焦 v__APP_VERSION__&nbsp; · &nbsp;本机 ASTAP + Gaia 亮星星表</span><span>星点解算与星表匹配均离线完成</span></div>
+        <div class="footer"><span>星点柔焦 v__APP_VERSION__&nbsp; · &nbsp;本机 ASTAP + Gaia 亮星星表</span><span>关闭最后一个工作页面后，程序在任务结束时退出并清理临时文件</span></div>
         <button id="exit" class="exit">退出程序</button>
       </section>
     </div>
@@ -103,6 +103,9 @@
     if(webLink){if(isPages){webLink.hidden=true;}else{const endpoint=new URL(BASE,location.href);webLink.href=`${WEB_APP_URL}?local=${encodeURIComponent(endpoint.origin+endpoint.pathname.replace(/\/+$/, ""))}`;}}
     const fileInput=$("file"), drop=$("drop"), start=$("start");
     if(isPages&&!BASE)$("exit").hidden=true;
+    const pageClientId=globalThis.crypto?.randomUUID?crypto.randomUUID():`${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const notifyLifecycle=route=>{if(!BASE)return;fetch(`${BASE}/api/client/${route}`,{method:"POST",body:new URLSearchParams({clientId:pageClientId}),keepalive:true}).catch(()=>{});};
+    if(BASE){notifyLifecycle("heartbeat");setInterval(()=>notifyLifecycle("heartbeat"),20000);window.addEventListener("pagehide",()=>{const payload=new URLSearchParams({clientId:pageClientId});navigator.sendBeacon(`${BASE}/api/client/close`,payload);});}
     let selectedFile=null, currentJob=null, busy=false;
     const setStatus=(text,percent=null)=>{ $("status").textContent=text; if(percent!==null){$("percent").textContent=`${percent}%`;$("bar").style.width=`${percent}%`;} };
     const formatBytes=n=>n<1024*1024?`${(n/1024).toFixed(0)} KB`:`${(n/1024/1024).toFixed(1)} MB`;

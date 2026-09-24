@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -82,7 +83,22 @@ PAGES_ORIGIN = "https://lzq1206.github.io"
 MAX_UPLOAD = 1_500_000_000
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
-TEMP_DIRS: list[str] = []
+TEMP_DIRS: set[str] = set()
+TEMP_DIRS_LOCK = threading.Lock()
+ACTIVE_CLIENTS: dict[str, float] = {}
+ACTIVE_CLIENTS_LOCK = threading.Lock()
+ACTIVE_TRANSFERS = 0
+ACTIVE_TRANSFERS_LOCK = threading.Lock()
+CLIENT_CONNECTED = threading.Event()
+SERVER_STOPPING = threading.Event()
+SERVER_STOPPING_LOCK = threading.Lock()
+CLIENT_STALE_SECONDS = 120
+CLIENT_CLOSE_GRACE_SECONDS = 4
+STARTUP_IDLE_SECONDS = 300
+JOB_RETENTION_SECONDS = 30 * 60
+DOWNLOADED_JOB_RETENTION_SECONDS = 10 * 60
+MAX_RETAINED_COMPLETED_JOBS = 3
+STALE_TEMP_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def _asset_path() -> Path:
@@ -90,9 +106,48 @@ def _asset_path() -> Path:
     return base / "ui" / "index.html"
 
 
+def _register_temp_dir(path: str) -> None:
+    with TEMP_DIRS_LOCK:
+        TEMP_DIRS.add(path)
+
+
+def _remove_temp_dir(path: str | None) -> None:
+    if not path:
+        return
+    with TEMP_DIRS_LOCK:
+        TEMP_DIRS.discard(path)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def _remove_temps() -> None:
-    for path in TEMP_DIRS:
+    with TEMP_DIRS_LOCK:
+        paths = tuple(TEMP_DIRS)
+        TEMP_DIRS.clear()
+    for path in paths:
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _cleanup_stale_temp_dirs() -> None:
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        candidates = tuple(temp_root.iterdir())
+    except OSError:
+        return
+    cutoff = time.time() - STALE_TEMP_MAX_AGE_SECONDS
+    with TEMP_DIRS_LOCK:
+        active_paths = {Path(path).resolve() for path in TEMP_DIRS}
+    for candidate in candidates:
+        if not candidate.name.startswith(("starsoft_", "starsoft-build-", "starsoft-solve-", "starsoft-solver-image-")):
+            continue
+        try:
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            resolved = candidate.resolve()
+            if resolved.parent != temp_root or resolved in active_paths or candidate.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(candidate, ignore_errors=True)
+        except OSError:
+            continue
 
 
 atexit.register(_remove_temps)
@@ -135,7 +190,120 @@ def _update_job(job_id: str, **values: object) -> None:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is not None:
+            if values.get("state") in {"complete", "error"} and job.get("state") == "processing":
+                job["finishedAt"] = time.time()
             job.update(values)
+
+
+def _release_job_directory(job_id: str, *, forget_job: bool = False) -> None:
+    temp_dir: str | None = None
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is not None:
+            temp_dir = job.pop("tempDir", None)
+            if forget_job:
+                JOBS.pop(job_id, None)
+            else:
+                job["tempDir"] = None
+                job["outputPath"] = None
+    _remove_temp_dir(temp_dir)
+
+
+def _prune_jobs(now: float | None = None) -> None:
+    current_time = time.time() if now is None else now
+    remove_ids: set[str] = set()
+    with JOBS_LOCK:
+        completed: list[tuple[float, str]] = []
+        for job_id, job in JOBS.items():
+            state = job.get("state")
+            if state == "processing":
+                continue
+            finished_at = float(job.get("finishedAt", job.get("createdAt", current_time)))
+            if state == "complete":
+                downloaded_at = job.get("downloadedAt")
+                reference_time = float(downloaded_at if downloaded_at is not None else finished_at)
+                retention = DOWNLOADED_JOB_RETENTION_SECONDS if downloaded_at is not None else JOB_RETENTION_SECONDS
+                if current_time - reference_time >= retention:
+                    remove_ids.add(job_id)
+                else:
+                    completed.append((finished_at, job_id))
+            elif current_time - finished_at >= JOB_RETENTION_SECONDS:
+                remove_ids.add(job_id)
+
+        retained = sorted((item for item in completed if item[1] not in remove_ids))
+        for _finished_at, job_id in retained[:-MAX_RETAINED_COMPLETED_JOBS]:
+            remove_ids.add(job_id)
+
+        temp_dirs: list[str] = []
+        for job_id in remove_ids:
+            job = JOBS.pop(job_id, None)
+            if job is not None and job.get("tempDir"):
+                temp_dirs.append(job["tempDir"])
+    for temp_dir in temp_dirs:
+        _remove_temp_dir(temp_dir)
+
+
+def _has_processing_jobs() -> bool:
+    with JOBS_LOCK:
+        return any(job.get("state") == "processing" for job in JOBS.values())
+
+
+def _begin_transfer() -> None:
+    global ACTIVE_TRANSFERS
+    with ACTIVE_TRANSFERS_LOCK:
+        ACTIVE_TRANSFERS += 1
+
+
+def _end_transfer() -> None:
+    global ACTIVE_TRANSFERS
+    with ACTIVE_TRANSFERS_LOCK:
+        ACTIVE_TRANSFERS = max(0, ACTIVE_TRANSFERS - 1)
+
+
+def _has_active_work() -> bool:
+    if _has_processing_jobs():
+        return True
+    with ACTIVE_TRANSFERS_LOCK:
+        return ACTIVE_TRANSFERS > 0
+
+
+def _expire_stale_clients() -> bool:
+    now = time.monotonic()
+    with ACTIVE_CLIENTS_LOCK:
+        stale = [client_id for client_id, last_seen in ACTIVE_CLIENTS.items() if now - last_seen >= CLIENT_STALE_SECONDS]
+        for client_id in stale:
+            ACTIVE_CLIENTS.pop(client_id, None)
+        return bool(ACTIVE_CLIENTS)
+
+
+def _request_shutdown(server: ThreadingHTTPServer) -> None:
+    with SERVER_STOPPING_LOCK:
+        if SERVER_STOPPING.is_set():
+            return
+        SERVER_STOPPING.set()
+    threading.Thread(target=server.shutdown, daemon=True).start()
+
+
+def _shutdown_after_page_close(server: ThreadingHTTPServer) -> None:
+    if SERVER_STOPPING.wait(CLIENT_CLOSE_GRACE_SECONDS):
+        return
+    _expire_stale_clients()
+    with ACTIVE_CLIENTS_LOCK:
+        clients_open = bool(ACTIVE_CLIENTS)
+    if not clients_open and CLIENT_CONNECTED.is_set() and not _has_active_work():
+        _request_shutdown(server)
+
+
+def _watch_lifecycle(server: ThreadingHTTPServer, started_at: float) -> None:
+    while not SERVER_STOPPING.wait(15):
+        _expire_stale_clients()
+        _prune_jobs()
+        with ACTIVE_CLIENTS_LOCK:
+            clients_open = bool(ACTIVE_CLIENTS)
+        if not clients_open and not _has_active_work():
+            if CLIENT_CONNECTED.is_set() or time.monotonic() - started_at >= STARTUP_IDLE_SECONDS:
+                _request_shutdown(server)
+                return
 
 
 def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str, float | str]) -> None:
@@ -194,6 +362,12 @@ def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str,
             input_path.unlink(missing_ok=True)
         except OSError:
             pass
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            failed = job is None or job.get("state") == "error"
+        if failed:
+            _release_job_directory(job_id)
+        _prune_jobs()
 
 
 def _make_handler(token: str):
@@ -241,6 +415,7 @@ def _make_handler(token: str):
             if route is None:
                 self._json(404, {"error": "not found"})
                 return
+            _prune_jobs()
             if route in ("/", ""):
                 try:
                     html = (
@@ -285,6 +460,7 @@ def _make_handler(token: str):
                         output_path = Path(job["outputPath"])
                         output_name = str(job["outputName"])
                 if action == "download" and output_path.is_file():
+                    _begin_transfer()
                     try:
                         size = output_path.stat().st_size
                         self.send_response(200)
@@ -302,6 +478,12 @@ def _make_handler(token: str):
                             shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
                     except OSError:
                         return
+                    finally:
+                        _end_transfer()
+                    with JOBS_LOCK:
+                        job = JOBS.get(job_id)
+                        if job is not None:
+                            job["downloadedAt"] = time.time()
                     return
             self._json(404, {"error": "not found"})
 
@@ -327,7 +509,41 @@ def _make_handler(token: str):
                 return
             if route == "/api/shutdown":
                 self._json(200, {"ok": True})
-                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                _request_shutdown(self.server)
+                return
+            if route in {"/api/client/heartbeat", "/api/client/close"}:
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._json(400, {"error": "客户端标识无效"})
+                    return
+                if content_length <= 0 or content_length > 256:
+                    self._json(400, {"error": "客户端标识无效"})
+                    return
+                try:
+                    body = self.rfile.read(content_length).decode("utf-8").strip()
+                    if self.headers.get_content_type() == "application/x-www-form-urlencoded":
+                        client_id = parse_qs(body).get("clientId", [""])[0]
+                    else:
+                        client_id = body
+                except (UnicodeDecodeError, ValueError):
+                    self._json(400, {"error": "客户端标识无效"})
+                    return
+                if not client_id or len(client_id) > 64 or not all(char.isalnum() or char in "-_" for char in client_id):
+                    self._json(400, {"error": "客户端标识无效"})
+                    return
+                if route.endswith("heartbeat"):
+                    with ACTIVE_CLIENTS_LOCK:
+                        ACTIVE_CLIENTS[client_id] = time.monotonic()
+                    CLIENT_CONNECTED.set()
+                    self._send(204, b"", "text/plain; charset=utf-8")
+                    return
+                with ACTIVE_CLIENTS_LOCK:
+                    ACTIVE_CLIENTS.pop(client_id, None)
+                    no_clients = not ACTIVE_CLIENTS
+                self._send(204, b"", "text/plain; charset=utf-8")
+                if no_clients:
+                    threading.Thread(target=_shutdown_after_page_close, args=(self.server,), daemon=True).start()
                 return
             if route != "/api/jobs":
                 self._json(404, {"error": "not found"})
@@ -375,44 +591,70 @@ def _make_handler(token: str):
             if params["max_radius"] < params["min_radius"]:
                 params["min_radius"], params["max_radius"] = params["max_radius"], params["min_radius"]
 
-            temp_dir = tempfile.mkdtemp(prefix="starsoft_")
-            TEMP_DIRS.append(temp_dir)
-            input_path = Path(temp_dir) / name
-            output_path = Path(temp_dir) / f"{Path(name).stem}_星点柔焦.tif"
-            remaining = content_length
+            _prune_jobs()
+            _begin_transfer()
+            temp_dir: str | None = None
             try:
-                with input_path.open("wb") as handle:
-                    while remaining:
-                        chunk = self.rfile.read(min(1024 * 1024, remaining))
-                        if not chunk:
-                            raise ConnectionError("文件上传未完成")
-                        handle.write(chunk)
-                        remaining -= len(chunk)
-            except (OSError, ConnectionError) as exc:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                self._json(400, {"error": f"读取上传文件失败：{exc}"})
-                return
+                temp_dir = tempfile.mkdtemp(prefix="starsoft_")
+                _register_temp_dir(temp_dir)
+                input_path = Path(temp_dir) / name
+                output_path = Path(temp_dir) / f"{Path(name).stem}_星点柔焦.tif"
+                remaining = content_length
+                try:
+                    with input_path.open("wb") as handle:
+                        while remaining:
+                            chunk = self.rfile.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise ConnectionError("文件上传未完成")
+                            handle.write(chunk)
+                            remaining -= len(chunk)
+                except (OSError, ConnectionError) as exc:
+                    _remove_temp_dir(temp_dir)
+                    temp_dir = None
+                    self._json(400, {"error": f"读取上传文件失败：{exc}"})
+                    return
 
-            job_id = secrets.token_urlsafe(18)
-            with JOBS_LOCK:
-                JOBS[job_id] = {
-                    "id": job_id,
-                    "state": "processing",
-                    "percent": 0,
-                    "message": "文件已接收，正在启动识别…",
-                    "sourceName": name,
-                    "outputName": output_path.name,
-                    "outputPath": str(output_path),
-                    "tempDir": temp_dir,
-                }
-            worker = threading.Thread(target=_run_job, args=(job_id, input_path, output_path, params), daemon=True)
-            worker.start()
+                job_id = secrets.token_urlsafe(18)
+                with JOBS_LOCK:
+                    JOBS[job_id] = {
+                        "id": job_id,
+                        "state": "processing",
+                        "percent": 0,
+                        "message": "文件已接收，正在启动识别…",
+                        "sourceName": name,
+                        "outputName": output_path.name,
+                        "outputPath": str(output_path),
+                        "tempDir": temp_dir,
+                        "createdAt": time.time(),
+                    }
+                worker = threading.Thread(target=_run_job, args=(job_id, input_path, output_path, params), daemon=True)
+                try:
+                    worker.start()
+                except RuntimeError as exc:
+                    _update_job(job_id, state="error", message=f"无法启动处理任务：{exc}", percent=0)
+                    _release_job_directory(job_id)
+                    self._json(500, {"error": "无法启动图像处理任务"})
+                    return
+            except Exception:
+                if temp_dir is not None:
+                    with JOBS_LOCK:
+                        registered_job = any(job.get("tempDir") == temp_dir for job in JOBS.values())
+                    if not registered_job:
+                        _remove_temp_dir(temp_dir)
+                raise
+            finally:
+                _end_transfer()
             self._json(202, {"id": job_id})
 
     return Handler
 
 
 def main() -> None:
+    CLIENT_CONNECTED.clear()
+    SERVER_STOPPING.clear()
+    with ACTIVE_CLIENTS_LOCK:
+        ACTIVE_CLIENTS.clear()
+    threading.Thread(target=_cleanup_stale_temp_dirs, daemon=True).start()
     token = secrets.token_urlsafe(24)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(token))
     server.daemon_threads = True
@@ -420,6 +662,8 @@ def main() -> None:
     url = f"http://127.0.0.1:{port}/{token}/"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    watcher = threading.Thread(target=_watch_lifecycle, args=(server, time.monotonic()), daemon=True)
+    watcher.start()
     try:
         if not _open_browser(url):
             log_path = _startup_log_path()

@@ -34,15 +34,15 @@ $distDir = Join-Path $buildRoot "dist"
 $workDir = Join-Path $buildRoot "work"
 $packageDir = Join-Path $buildRoot "package"
 $solverDir = Join-Path $buildRoot "solver"
-New-Item -ItemType Directory -Path $distDir, $workDir, $packageDir -Force | Out-Null
-$solverScript = Join-Path $project "scripts\prepare_astap.py"
-& $python $solverScript --output $solverDir --platform windows
-if ($LASTEXITCODE -ne 0) { throw "下载或整理本机板解算组件失败。" }
-$uiFile = Join-Path $project "ui\index.html"
-$dataArgument = "$uiFile;ui"
-$exePath = Join-Path $distDir "星点柔焦.exe"
-
 try {
+    New-Item -ItemType Directory -Path $distDir, $workDir, $packageDir -Force | Out-Null
+    $solverScript = Join-Path $project "scripts\prepare_astap.py"
+    & $python $solverScript --output $solverDir --platform windows
+    if ($LASTEXITCODE -ne 0) { throw "下载或整理本机板解算组件失败。" }
+    $uiFile = Join-Path $project "ui\index.html"
+    $dataArgument = "$uiFile;ui"
+    $exePath = Join-Path $distDir "星点柔焦.exe"
+
     Push-Location $project
     try {
         & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --distpath $distDir --workpath $workDir --specpath $buildRoot --collect-all rawpy --collect-all sep --collect-all tifffile --collect-all astropy --add-data $dataArgument app.py
