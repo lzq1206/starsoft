@@ -4,7 +4,7 @@
 
 ## 使用
 
-1. Windows 解压对应版本 ZIP 后双击 `星点柔焦.exe`。macOS 解压对应架构 ZIP 后，在 Finder 中按住 Control 并点按“星点柔焦.app”，选择“打开”。
+1. Windows 解压对应版本 ZIP 后双击 `星点柔焦.exe`。macOS 解压对应架构 ZIP 后，在 Finder 中按住 Control 并点按“星点柔焦.app”，选择“打开”。macOS 启动失败时会显示错误并写入 `~/Library/Logs/StarSoftFocus/startup.log`。
 2. 程序先打开本机处理界面；点按标题栏的“网页版”可打开 GitHub Pages 前端。图像解码、星点检测与 ASTAP 板解算都在本机完成。
 3. 选择 RAW、TIFF 或 JPG 文件。RAW 会读取可用镜头数据，并依焦距决定星点检测分辨率。
 4. 选择亮度来源：“根据真实星表亮度”用本机 WCS 将星点与 W08 星表匹配，按 Gaia 派生 G 星等筛选；部分广角、严重畸变或星点较少的照片可能解算失败。“图像解析星点亮度”使用 1.4.7 的 SEP 相对圆孔径测光，不依赖板解算。亮度范围控制 Δm 默认 5.0 等，范围 0–10 等；数值越大，纳入的较暗点源越多，不限处理数量。星表模式使用的 W08 索引约完整至 G=8 等、精度为 0.1 等，不含 Gaia source_id 或 BP-RP。

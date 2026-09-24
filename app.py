@@ -8,18 +8,73 @@ import json
 import os
 import secrets
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from PIL import Image
 
-from processor import RawInfo, process_raw
-from version import APP_VERSION
+def _startup_log_path() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Logs" / "StarSoftFocus" / "startup.log"
+    return Path(tempfile.gettempdir()) / "StarSoftFocus-startup.log"
+
+
+def _write_startup_log(message: str) -> Path | None:
+    try:
+        path = _startup_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(message.rstrip() + "\n", encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
+def _show_startup_message(message: str, title: str = "星点柔焦启动失败") -> None:
+    if sys.platform == "darwin":
+        escaped_title = title.replace("\\", "\\\\").replace('"', '\\"')
+        escaped_message = message.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        script = f'display dialog "{escaped_message}" with title "{escaped_title}" buttons {{"好"}} default button "好"'
+        try:
+            subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    elif os.name == "nt":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+        except Exception:
+            pass
+
+
+def _report_startup_error(details: str) -> None:
+    log_path = _write_startup_log(details)
+    message = details.strip().splitlines()[-1] if details.strip() else "未知启动错误"
+    if log_path:
+        message += f"\n\n详细日志：{log_path}"
+    _show_startup_message(message)
+
+
+try:
+    from PIL import Image
+
+    from processor import RawInfo, process_raw
+    from version import APP_VERSION
+except Exception:
+    _report_startup_error(traceback.format_exc())
+    raise
 
 
 APP_NAME = "星点柔焦"
@@ -41,6 +96,33 @@ def _remove_temps() -> None:
 
 
 atexit.register(_remove_temps)
+
+
+def _open_browser(url: str) -> bool:
+    if sys.platform == "darwin":
+        try:
+            opened = subprocess.run(
+                ["/usr/bin/open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            if opened.returncode == 0:
+                return True
+            detail = opened.stderr.strip() or f"open exited with code {opened.returncode}"
+            _write_startup_log(f"macOS 'open' failed: {detail}")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _write_startup_log(f"macOS 'open' failed: {exc}")
+    try:
+        opened = bool(webbrowser.open_new(url))
+        if not opened:
+            _write_startup_log("macOS and Python browser launch methods both failed.")
+        return opened
+    except Exception as exc:
+        _write_startup_log(f"Python webbrowser failed: {exc}")
+        return False
 
 
 def _safe_filename(name: str) -> str:
@@ -338,24 +420,26 @@ def main() -> None:
     url = f"http://127.0.0.1:{port}/{token}/"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    opened = webbrowser.open_new(url)
-    if not opened and os.name == "nt":
-        import ctypes
-
-        ctypes.windll.user32.MessageBoxW(0, f"无法自动打开浏览器，请复制此地址：\n{url}", APP_NAME, 0x40)
     try:
+        if not _open_browser(url):
+            log_path = _startup_log_path()
+            _show_startup_message(
+                f"无法自动打开浏览器。请在浏览器中打开以下本机地址：\n{url}"
+                + (f"\n\n启动日志：{log_path}" if log_path else ""),
+                title="星点柔焦：浏览器未打开",
+            )
         thread.join()
     except KeyboardInterrupt:
-        pass
+        return
     finally:
+        if thread.is_alive():
+            server.shutdown()
         server.server_close()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception as exc:
-        if os.name == "nt":
-            import ctypes
-
-            ctypes.windll.user32.MessageBoxW(0, f"程序启动失败：\n{exc}", APP_NAME, 0x10)
+    except Exception:
+        _report_startup_error(traceback.format_exc())
+        raise SystemExit(1)
