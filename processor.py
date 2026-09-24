@@ -75,6 +75,7 @@ class Star:
     catalog_bp_rp: float | None = None
     catalog_source_id: int | None = None
     catalog_delta_magnitude: float | None = None
+    catalog_position_recovered: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,8 @@ class ProcessResult:
     candidate_count: int
     selected_count: int
     catalog_match_count: int
+    recovered_catalog_star_count: int
+    brightness_source: str
     relative_magnitude_limit: float
     width: int
     height: int
@@ -951,6 +954,8 @@ def _soften_stars(
     strength: float,
     opacity: float,
     sky_background_level: float,
+    brightness_source: str,
+    relative_magnitude_limit: float,
     progress: Progress | None = None,
 ) -> list[dict[str, object]]:
     if not stars or strength <= 0:
@@ -1081,9 +1086,8 @@ def _soften_stars(
             "color_fraction": color_fraction,
         })
 
-    # Match the magnitude-based response used by the earlier 18ffa10 build:
-    # delta magnitude is logarithmic in measured flux, then maps linearly to
-    # radius. A square-root response made most stars cluster near max_radius.
+    # Catalogue mode maps its matched catalogue span to the radius range.
+    # Image mode retains the 1.4.7 response against the selected Δm limit.
     flux_floor = min(float(item["star"].flux) for item in prepared)
     brightest_flux = max(float(item["star"].flux) for item in prepared)
     reference_peak = max(float(item["source_peak"]) for item in prepared)
@@ -1093,8 +1097,15 @@ def _soften_stars(
     )
     for item in prepared:
         star = item["star"]
-        log_flux = max(math.log(max(float(star.flux), 1e-20) / max(flux_floor, 1e-20)), 0.0)
-        response = float(np.clip(log_flux / max_log_flux, 0.0, 1.0)) if max_log_flux > 1e-12 else 1.0
+        if brightness_source == "image":
+            delta_magnitude = -2.5 * math.log10(max(float(star.relative_flux_ratio), 1e-20))
+            response = (
+                float(np.clip(1.0 - delta_magnitude / relative_magnitude_limit, 0.0, 1.0))
+                if relative_magnitude_limit > 1e-12 else 1.0
+            )
+        else:
+            log_flux = max(math.log(max(float(star.flux), 1e-20) / max(flux_floor, 1e-20)), 0.0)
+            response = float(np.clip(log_flux / max_log_flux, 0.0, 1.0)) if max_log_flux > 1e-12 else 1.0
         radius = min_radius + (max_radius - min_radius) * response
         diffusion_sigma = (radius / 3.0) * math.sqrt(float(np.clip(strength, 0.0, 30.0)) / 40.0)
         # Keep the measured radial PSF shape, but use it as a peak-matched
@@ -1190,8 +1201,14 @@ def _soften_stars(
             "catalog_g_magnitude": round(float(star.catalog_g_mag), 1) if star.catalog_g_mag is not None else None,
             "catalog_bp_rp_colour_index": round(float(star.catalog_bp_rp), 5) if star.catalog_bp_rp is not None else None,
             "gaia_delta_g_from_brightest": round(float(star.catalog_delta_magnitude), 5) if star.catalog_delta_magnitude is not None else None,
+            "catalog_position_recovered_from_wcs": bool(star.catalog_position_recovered),
+            "image_delta_magnitude": round(float(-2.5 * math.log10(max(float(star.relative_flux_ratio), 1e-20))), 5) if brightness_source == "image" else None,
             "relative_flux_ratio": round(float(star.relative_flux_ratio), 6),
-            "radius_curve": "linear response to relative Gaia G magnitude; log(catalog_flux/faintest_selected_flux)",
+            "radius_curve": (
+                "1.4.7 relative SEP aperture magnitude: clamp(1 - delta_m/selected_limit, 0, 1)"
+                if brightness_source == "image"
+                else "linear response to relative Gaia G magnitude; log(catalog_flux/faintest_selected_flux)"
+            ),
             "source_signal_to_noise": round(float(star.signal_to_noise), 3),
             "radius_response": round(float(item["radius_response"]), 5),
             "halo_flux_scale": round(float(item["halo_flux_scale"]), 6),
@@ -1230,7 +1247,8 @@ def process_raw(
     sensitivity: float = 4.8,
     strength: float = 10.0,
     opacity: float = 30.0,
-    relative_magnitude_limit: float = 3.0,
+    brightness_source: str = "catalog",
+    relative_magnitude_limit: float = 5.0,
     min_radius: float = 3.0,
     max_radius: float = 42.0,
     progress: Progress | None = None,
@@ -1244,6 +1262,9 @@ def process_raw(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if max_radius < min_radius:
         min_radius, max_radius = max_radius, min_radius
+    brightness_source = str(brightness_source).strip().lower()
+    if brightness_source not in {"catalog", "image"}:
+        raise ValueError("星点亮度来源无效，请选择真实星表亮度或图像解析星点亮度。")
     relative_magnitude_limit = float(np.clip(relative_magnitude_limit, 0.0, 10.0))
     strength = float(np.clip(strength, 0.0, 30.0))
     opacity = float(np.clip(opacity, 0.0, 100.0))
@@ -1290,7 +1311,7 @@ def process_raw(
             if raster.linear_srgb
             else "native source channel encoding retained; original ICC profile bytes preserved"
         )
-        report(36, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个符合相对星等范围，开始柔焦…")
+        report(36, f"天空区域找到 {candidate_count:,} 个点源候选，准备按亮度来源筛选…")
     else:
         raw_extensions = {
             ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".sr2", ".srf", ".dng",
@@ -1355,7 +1376,7 @@ def process_raw(
                 raw_brightness_calibration_method = "non-sRGB embedded preview left in its original colour space; XMP Exposure2012 only"
             elif raw_xmp_exposure_ev is not None:
                 raw_brightness_calibration_method = "XMP Exposure2012 only; no embedded preview or Adobe TIFF reference"
-            report(43, f"天空区域找到 {candidate_count:,} 个点源，{selected_count:,} 个符合相对星等范围，正在解码 RAW…")
+            report(43, f"天空区域找到 {candidate_count:,} 个点源候选，正在解码 RAW…")
             rgb = raw.postprocess(
                 gamma=(1, 1),
                 no_auto_bright=True,
@@ -1381,72 +1402,122 @@ def process_raw(
         input_kind = "RAW"
         encoding = "RAW developed to 16-bit sRGB with XMP/sRGB-preview or matching Adobe Camera Raw TIFF exposure calibration and highlight preservation; halo processing uses float32 linear-light values; sRGB ICC profile embedded"
 
-    report(45, "图像解码完成，正在本机解算星空坐标…")
-    solver_scale_xy = (
-        image_data.shape[1] / detector.shape[1],
-        image_data.shape[0] / detector.shape[0],
-    )
-    primary_solver_path: Path | None = None
-    if input_path.suffix.lower() in {".tif", ".tiff"}:
-        try:
-            with tifffile.TiffFile(input_path) as source_tiff:
-                source_page = source_tiff.pages[0]
-                orientation_tag = source_page.tags.get("Orientation")
-                source_orientation = int(orientation_tag.value) if orientation_tag is not None else 1
-                if (
-                    source_orientation == 1
-                    and source_page.imagelength == image_data.shape[0]
-                    and source_page.imagewidth == image_data.shape[1]
-                ):
-                    primary_solver_path = input_path
-        except (OSError, ValueError, tifffile.TiffFileError):
-            primary_solver_path = None
-    with tempfile.TemporaryDirectory(prefix="starsoft-solver-image-") as solver_directory:
-        solver_image_path = Path(solver_directory) / "solver_16bit.tif"
-        _write_solver_grayscale(image_data, solver_image_path, sky_mask)
-        catalog_matches, catalog_position_count = match_local_bright_stars(
-            stars,
-            detector,
-            sky_mask,
-            info,
-            solver_image_path,
-            solver_scale_xy,
-            primary_solver_path,
-            progress=report,
+    detector_stars = stars
+    catalog_position_count = 0
+    catalog_match_count = 0
+    recovered_catalog_star_count = 0
+    catalog_reference_g_mag: float | None = None
+    if brightness_source == "catalog":
+        report(45, "图像解码完成，正在本机解算星空坐标…")
+        solver_scale_xy = (
+            image_data.shape[1] / detector.shape[1],
+            image_data.shape[0] / detector.shape[0],
         )
-    catalog_match_count = len(catalog_matches)
-    if catalog_match_count == 0:
-        raise ValueError("随程序提供的 Gaia 亮星索引没有找到本图对应星点；请确认照片星点清晰并且 EXIF 镜头信息完整。")
-    reference_g_mag = min(match.g_mag for match in catalog_matches.values())
-    catalog_stars: list[Star] = []
-    for detection_index, star in enumerate(stars):
-        match = catalog_matches.get(detection_index)
-        if match is None:
-            continue
-        delta_g = max(0.0, float(match.g_mag - reference_g_mag))
-        if delta_g > relative_magnitude_limit:
-            continue
-        relative_catalog_flux = 10.0 ** (-0.4 * delta_g)
-        bp_rp = (
-            float(match.bp_mag - match.rp_mag)
-            if match.bp_mag is not None and match.rp_mag is not None
-            else None
+        primary_solver_path: Path | None = None
+        if input_path.suffix.lower() in {".tif", ".tiff"}:
+            try:
+                with tifffile.TiffFile(input_path) as source_tiff:
+                    source_page = source_tiff.pages[0]
+                    orientation_tag = source_page.tags.get("Orientation")
+                    source_orientation = int(orientation_tag.value) if orientation_tag is not None else 1
+                    if (
+                        source_orientation == 1
+                        and source_page.imagelength == image_data.shape[0]
+                        and source_page.imagewidth == image_data.shape[1]
+                    ):
+                        primary_solver_path = input_path
+            except (OSError, ValueError, tifffile.TiffFileError):
+                primary_solver_path = None
+        with tempfile.TemporaryDirectory(prefix="starsoft-solver-image-") as solver_directory:
+            solver_image_path = Path(solver_directory) / "solver_16bit.tif"
+            _write_solver_grayscale(image_data, solver_image_path, sky_mask)
+            catalog_matches, catalog_position_count, recovered_sources = match_local_bright_stars(
+                detector_stars,
+                detector,
+                sky_mask,
+                info,
+                solver_image_path,
+                solver_scale_xy,
+                primary_solver_path,
+                relative_magnitude_limit=relative_magnitude_limit,
+                sensitivity=sensitivity,
+                progress=report,
+            )
+        catalog_match_count = len(catalog_matches) + len(recovered_sources)
+        catalog_entries: list[tuple[Star, float, bool]] = [
+            (detector_stars[index], match.g_mag, False)
+            for index, match in catalog_matches.items()
+            if 0 <= index < len(detector_stars)
+        ]
+        catalog_entries.extend((
+            Star(
+                source.x,
+                source.y,
+                source.flux,
+                source.peak,
+                source.fwhm,
+                1.0,
+                source.a,
+                source.b,
+                source.theta,
+                source.signal_to_noise,
+                False,
+                source.flux,
+            ),
+            source.g_mag,
+            True,
+        ) for source in recovered_sources)
+        if not catalog_entries:
+            raise ValueError(
+                "真实星表亮度模式未能匹配到可靠亮星或解算位置附近没有可确认的星点。"
+                "可切换到“图像解析星点亮度”继续处理。"
+            )
+        catalog_reference_g_mag = min(g_mag for _star, g_mag, _recovered in catalog_entries)
+        catalog_stars: list[Star] = []
+        for star, g_mag, was_recovered in catalog_entries:
+            delta_g = max(0.0, float(g_mag - catalog_reference_g_mag))
+            if delta_g > relative_magnitude_limit:
+                continue
+            relative_catalog_flux = 10.0 ** (-0.4 * delta_g)
+            catalog_stars.append(replace(
+                star,
+                flux=relative_catalog_flux,
+                relative_flux_ratio=relative_catalog_flux,
+                image_flux=star.image_flux if star.image_flux is not None else star.flux,
+                catalog_g_mag=g_mag,
+                catalog_delta_magnitude=delta_g,
+                catalog_position_recovered=was_recovered,
+            ))
+            recovered_catalog_star_count += int(was_recovered)
+        stars = sorted(catalog_stars, key=lambda star: star.catalog_g_mag if star.catalog_g_mag is not None else math.inf)
+        selected_count = len(stars)
+        if selected_count == 0:
+            raise ValueError("本地星表匹配成功，但所选相对星等范围内没有星点；请增大亮度范围控制值。")
+        report(
+            61,
+            f"本机星表匹配 {catalog_match_count:,} 个点位（含位置补配 {len(recovered_sources):,} 个），"
+            f"其中 {selected_count:,} 个符合 ΔG 范围，正在柔焦…",
         )
-        catalog_stars.append(replace(
-            star,
-            flux=relative_catalog_flux,
-            relative_flux_ratio=relative_catalog_flux,
-            image_flux=star.flux,
-            catalog_g_mag=match.g_mag,
-            catalog_bp_rp=bp_rp,
-            catalog_source_id=match.source_id,
-            catalog_delta_magnitude=delta_g,
-        ))
-    stars = sorted(catalog_stars, key=lambda star: star.catalog_g_mag if star.catalog_g_mag is not None else math.inf)
-    selected_count = len(stars)
-    if selected_count == 0:
-        raise ValueError("Gaia DR3 星表匹配成功，但所选相对星等范围内没有星点；请增大亮度范围控制值。")
-    report(61, f"本机亮星星表匹配 {catalog_match_count:,} 个点源，其中 {selected_count:,} 个符合 ΔG 范围，正在柔焦…")
+    else:
+        report(45, "图像解码完成，正在按 1.4.7 图像相对亮度筛选星点…")
+        brightest_image_flux = max((star.flux for star in detector_stars), default=0.0)
+        if brightest_image_flux <= 0.0:
+            raise ValueError("图像解析模式没有可用的星点测光结果。")
+        image_stars: list[Star] = []
+        for star in detector_stars:
+            relative_flux = float(star.flux) / brightest_image_flux
+            delta_m = -2.5 * math.log10(max(relative_flux, 1e-20))
+            if delta_m <= relative_magnitude_limit + 1e-9:
+                image_stars.append(replace(
+                    star,
+                    relative_flux_ratio=relative_flux,
+                    image_flux=star.flux,
+                ))
+        stars = image_stars
+        selected_count = len(stars)
+        if selected_count == 0:
+            raise ValueError("当前图像亮度范围内没有检出的星点，请增大 Δm 或降低星点识别灵敏度。")
+        report(61, f"SEP 检出 {candidate_count:,} 个点源，其中 {selected_count:,} 个符合 Δm 范围，正在柔焦…")
     star_measurements = _soften_stars(
         image_data,
         stars,
@@ -1456,6 +1527,8 @@ def process_raw(
         strength,
         opacity,
         sky_background_level,
+        brightness_source,
+        relative_magnitude_limit,
         report,
     )
     report(92, "正在写入 16 位 TIFF…")
@@ -1484,20 +1557,42 @@ def process_raw(
         "aperture": info.aperture,
         "detected_stars": len(stars),
         "point_source_candidates": candidate_count,
+        "brightness_source": brightness_source,
+        "brightness_source_label": "真实星表亮度" if brightness_source == "catalog" else "图像解析星点亮度",
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
-        "star_selection": "ASTAP W08 all-sky bright-star index with Gaia-derived G magnitudes rounded to 0.1 mag; select matched sources within delta G of the brightest local catalogue match",
-        "catalog": "Bundled ASTAP W08 Gaia-derived all-sky bright-star index (approximately complete through G=8); WCS solving and coordinate cross-match are local and offline",
+        "star_selection": (
+            "ASTAP W08 Gaia-derived G magnitudes rounded to 0.1 mag; select matched and WCS-position-recovered point sources within delta G of the brightest local catalogue match"
+            if brightness_source == "catalog"
+            else "1.4.7 SEP circular-aperture image photometry; select point sources within delta m of the brightest detected sky source"
+        ),
+        "catalog": (
+            "Bundled ASTAP W08 Gaia-derived all-sky bright-star index (approximately complete through G=8); WCS solving and coordinate cross-match are local and offline"
+            if brightness_source == "catalog" else None
+        ),
         "catalog_match_count": catalog_match_count,
+        "catalog_position_recovered_count": recovered_catalog_star_count,
         "catalog_position_count_checked_locally": catalog_position_count,
-        "catalog_reference_g_magnitude": round(reference_g_mag, 5),
-        "catalog_photometry_fields": ["Gaia-derived G magnitude (W08, 0.1 mag resolution)"],
+        "catalog_reference_g_magnitude": round(catalog_reference_g_mag, 5) if catalog_reference_g_mag is not None else None,
+        "catalog_photometry_fields": ["Gaia-derived G magnitude (W08, 0.1 mag resolution)"] if brightness_source == "catalog" else [],
         "relative_magnitude_limit": relative_magnitude_limit,
         "relative_flux_floor_ratio": round(10.0 ** (-0.4 * relative_magnitude_limit), 8),
-        "relative_magnitude_difference_definition": "delta_G=local W08 G magnitude minus the brightest matched W08 G magnitude; include catalogue-matched point sources where delta_G is at most the selected limit",
+        "relative_magnitude_difference_definition": (
+            "delta_G=local W08 G magnitude minus the brightest detected or position-recovered W08 source; include sources where delta_G is at most the selected limit"
+            if brightness_source == "catalog"
+            else "delta_m=-2.5*log10(SEP circular-aperture flux / brightest detected SEP aperture flux); include sources where delta_m is at most the selected limit"
+        ),
         "soft_focus": "strictly circular isotropic Gaussian diffusion convolved with an RGB stellar radial profile sampled by circular-annulus medians; x and y sigma are equal and SEP ellipticity/angle never shapes the halo; the convolved profile is peak-matched to the historical relative-flux and color response, then only positive lightening difference is blended over the source with a circular smoothstep feather mask",
         "halo_geometry": "strictly circular; Euclidean radial bins and equal x/y Gaussian sigma; source ellipticity and position angle are not used to shape the halo",
-        "brightness_to_radius_curve": "linear response to relative local W08 G magnitude rounded to 0.1 mag: log(catalog_flux/faintest_selected_flux) normalized to the brightest selected catalogue source, matching 18ffa10 mapping",
-        "brightness_to_halo_strength_curve": "each selected star's measured RGB radial profile is scattered by an isotropic Gaussian kernel and peak-matched to the local catalogue G-band relative flux; per-channel halo colour comes from the source image RGB profile",
+        "brightness_to_radius_curve": (
+            "linear response to relative local W08 G magnitude rounded to 0.1 mag: log(catalog_flux/faintest_selected_flux) normalized to the brightest selected catalogue source, matching 18ffa10 mapping"
+            if brightness_source == "catalog"
+            else "1.4.7 linear response to SEP relative aperture magnitude: clamp(1-delta_m/selected_limit, 0, 1)"
+        ),
+        "brightness_to_halo_strength_curve": (
+            "each selected star's measured RGB radial profile is scattered by an isotropic Gaussian kernel and peak-matched to local W08 relative G-band flux; per-channel halo colour comes from the source image RGB profile"
+            if brightness_source == "catalog"
+            else "each selected star's measured RGB radial profile is scattered by an isotropic Gaussian kernel and peak-matched to 1.4.7 SEP relative aperture flux; per-channel halo colour comes from the source image RGB profile"
+        ),
         "soft_focus_strength": round(strength, 1),
         "soft_focus_strength_note": "Gaussian scattering-kernel sigma=(radius/3)*sqrt(strength/40); default strength 10, maximum 30; opacity controls the blend amount independently",
         "soft_focus_opacity_percent": round(opacity, 1),
@@ -1552,6 +1647,8 @@ def process_raw(
         candidate_count=candidate_count,
         selected_count=selected_count,
         catalog_match_count=catalog_match_count,
+        recovered_catalog_star_count=recovered_catalog_star_count,
+        brightness_source=brightness_source,
         relative_magnitude_limit=relative_magnitude_limit,
         width=int(pixels16.shape[1]),
         height=int(pixels16.shape[0]),

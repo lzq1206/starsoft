@@ -144,5 +144,5 @@ jobs:
             gh release create "$tag" release-assets/* \
               --target "$GITHUB_SHA" \
               --title "星点柔焦 ${version}" \
-              --notes "Windows、macOS Apple 芯片与 Intel 版本，均包含 ASTAP 本机板解算器和 Gaia 派生的 W08 全天天亮星索引（约 G=8）。星点解算和亮星匹配全程离线；macOS 包目前未使用 Apple Developer ID 签名或公证。"
+              --notes "Windows、macOS Apple 芯片与 Intel 版本。星点亮度可选择本机 W08 星表 G 星等，或沿用 1.4.7 的 SEP 图像测光；广角模式会分块解算并尝试补配漏检的目录亮星。所有解算和匹配均离线；macOS 包目前未使用 Apple Developer ID 签名或公证。"
           fi

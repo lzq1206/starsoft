@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
+import sep
 import tifffile
 from astropy.io import fits
 from astropy.wcs import WCS
@@ -40,6 +41,21 @@ class CatalogMatch:
     g_mag: float
     bp_mag: float | None
     rp_mag: float | None
+    separation_arcsec: float
+
+
+@dataclass(frozen=True)
+class RecoveredCatalogStar:
+    g_mag: float
+    x: float
+    y: float
+    flux: float
+    peak: float
+    fwhm: float
+    a: float
+    b: float
+    theta: float
+    signal_to_noise: float
     separation_arcsec: float
 
 
@@ -198,7 +214,7 @@ def _positions_to_sky(
     detector_scale_xy: tuple[float, float],
     primary_image_path: Path | None,
     progress: Progress | None,
-) -> tuple[list[tuple[int, float, float]], float, float]:
+) -> tuple[list[tuple[int, float, float]], float, float, list[SolverTile]]:
     executable, catalogs = _executable_and_catalogs()
     detector_height, detector_width = detector.shape
     detector_scale_x, detector_scale_y = detector_scale_xy
@@ -234,8 +250,20 @@ def _positions_to_sky(
     tile_w = min(solver_width, max(1200, int(round(solver_width * tile_w_fraction))))
     tile_h = min(valid_height, max(1200, int(round(valid_height * tile_h_fraction))))
     if tile_w < solver_width or tile_h < solver_height:
-        x_starts = sorted(set((0, max(0, solver_width - tile_w))))
-        y_starts = sorted(set((0, max(0, valid_height - tile_h))))
+        def starts(length: int, tile: int) -> list[int]:
+            if length <= tile:
+                return [0]
+            last = length - tile
+            stride = max(1, int(tile * 0.68))
+            values = list(range(0, last + 1, stride))
+            values.append(last)
+            unique = sorted(set(values))
+            # Solve the four extreme areas first so the edges are covered even
+            # when an unusually wide field reaches the overall time budget.
+            return list(dict.fromkeys([0, last, *unique[1:-1]]))
+
+        x_starts = starts(solver_width, tile_w)
+        y_starts = starts(valid_height, tile_h)
         crop_boxes = [
             (x, y, min(solver_width, x + tile_w), min(valid_height, y + tile_h))
             for y in y_starts for x in x_starts
@@ -246,7 +274,7 @@ def _positions_to_sky(
 
     successful: list[SolverTile] = []
     diagnostics: list[str] = []
-    solve_deadline = time.monotonic() + 60.0
+    solve_deadline = time.monotonic() + 90.0
     with tempfile.TemporaryDirectory(prefix="starsoft-solve-") as temporary:
         work_dir = Path(temporary)
         total_attempts = len(boxes)
@@ -254,7 +282,7 @@ def _positions_to_sky(
         for index, (x0, y0, x1, y1) in enumerate(boxes):
             remaining_seconds = solve_deadline - time.monotonic()
             if remaining_seconds <= 0:
-                diagnostics.append("本机板解算达到 60 秒时间上限。")
+                diagnostics.append("本机板解算达到 90 秒时间上限。")
                 break
             if progress:
                 progress(45 + int(8 * index / max(total_attempts, 1)),
@@ -281,17 +309,16 @@ def _positions_to_sky(
                     str(image_path), solver_source[y0:y1, x0:x1],
                     compression=None, photometric="minisblack",
                 )
-            wide_field = fov_y > 20.0
-            full_tiff_available = primary_image_path is not None and is_full_frame
-            use_distortion_fit = wide_field and full_tiff_available
+            wide_field = max(fov_x, fov_y) > 20.0
+            use_distortion_fit = wide_field
             command = [
                 str(executable), "-f", str(image_path), "-fov", f"{fov_y:.5f}",
                 "-d", str(catalogs), "-z", "0",
                 "-speed", "slow" if use_distortion_fit else "auto",
-                "-s", "1500" if use_distortion_fit else "500",
+                "-s", "1500" if use_distortion_fit else "1000",
                 "-t", "0.007", "-wcs", "-sip", "-log", "-o", str(output_base),
             ]
-            if fov_y > 20.0:
+            if wide_field:
                 command[command.index("-z"):command.index("-z")] = ["-D", "w08"]
             try:
                 completed = subprocess.run(
@@ -320,7 +347,7 @@ def _positions_to_sky(
                 ]
                 if useful_lines:
                     diagnostics.append(f"{image_path.name}: {' | '.join(useful_lines[-4:])}")
-            if can_solve_full and successful:
+            if can_solve_full and successful and max(full_fov_width, full_fov_height) <= 30.0:
                 break
         solver_source._mmap.close()
 
@@ -353,10 +380,135 @@ def _positions_to_sky(
             continue
         if math.isfinite(ra) and math.isfinite(dec) and -90.0 <= dec <= 90.0:
             source_positions.append((index, ra, dec))
-    if len(source_positions) < 8:
-        raise RuntimeError("可信板解算区域内的可匹配点源不足，无法执行 Gaia 星表测光。")
     pixel_scale = float(np.median([tile.pixel_scale_arcsec for tile in successful]))
-    return source_positions, pixel_scale, full_fov_height
+    return source_positions, pixel_scale, full_fov_height, successful
+
+
+def _recover_catalog_source_near_pixel(
+    detector: np.ndarray,
+    sky_mask: np.ndarray | None,
+    expected_x: float,
+    expected_y: float,
+    search_radius: float,
+    psf_fwhm: float,
+    sensitivity: float,
+) -> tuple[float, float, float, float, float, float, float, float, float, float] | None:
+    """Use the WCS prediction as a prior, then require a compact local SEP source."""
+    height, width = detector.shape
+    if not (math.isfinite(expected_x) and math.isfinite(expected_y)):
+        return None
+    center_x, center_y = int(round(expected_x)), int(round(expected_y))
+    if not (0 <= center_x < width and 0 <= center_y < height):
+        return None
+    if sky_mask is not None and sky_mask.shape == detector.shape and sky_mask[center_y, center_x]:
+        return None
+
+    half = max(12, int(math.ceil(search_radius + 7.0)))
+    x0, x1 = max(0, center_x - half), min(width, center_x + half + 1)
+    y0, y1 = max(0, center_y - half), min(height, center_y + half + 1)
+    patch = np.asarray(detector[y0:y1, x0:x1], dtype=np.float32)
+    if patch.shape[0] < 15 or patch.shape[1] < 15:
+        return None
+    patch_mask = None
+    if sky_mask is not None and sky_mask.shape == detector.shape:
+        patch_mask = np.asarray(sky_mask[y0:y1, x0:x1], dtype=bool)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    radius = np.hypot(xx - expected_x, yy - expected_y)
+    valid = np.isfinite(patch)
+    if patch_mask is not None:
+        valid &= ~patch_mask
+    background_pixels = patch[(radius >= max(6.0, search_radius + 2.0)) & (radius <= half - 1.0) & valid]
+    source_pixels = patch[(radius <= search_radius) & valid]
+    if background_pixels.size < 24 or source_pixels.size < 4:
+        return None
+    local_background = float(np.median(background_pixels))
+    mad = float(np.median(np.abs(background_pixels - local_background)))
+    local_noise = max(1.4826 * mad, 1e-8)
+    peak = float(np.max(source_pixels))
+    if peak - local_background < max(2.5, min(float(sensitivity), 5.0) * 0.75) * local_noise:
+        return None
+
+    safe_patch = np.nan_to_num(patch, nan=local_background, posinf=local_background, neginf=local_background)
+    block_x = max(4, min(16, safe_patch.shape[1] // 2))
+    block_y = max(4, min(16, safe_patch.shape[0] // 2))
+    try:
+        background = sep.Background(safe_patch, mask=patch_mask, bw=block_x, bh=block_y, fw=3, fh=3)
+        signal = np.ascontiguousarray(safe_patch - background.back(), dtype=np.float32)
+        noise = np.ascontiguousarray(np.maximum(background.rms(), local_noise), dtype=np.float32)
+        objects = sep.extract(
+            signal,
+            max(2.5, min(float(sensitivity), 5.0) * 0.75),
+            err=noise,
+            mask=patch_mask,
+            minarea=3,
+            deblend_nthresh=16,
+            deblend_cont=0.005,
+            clean=True,
+            segmentation_map=False,
+        )
+    except Exception:
+        return None
+    if len(objects) == 0:
+        return None
+
+    fwhm = 2.354820045 * np.sqrt(np.maximum(objects["a"] * objects["b"], 0.0))
+    major = np.maximum(objects["a"], objects["b"])
+    minor = np.minimum(objects["a"], objects["b"])
+    roundness = minor / np.maximum(major, 1e-8)
+    distance = np.hypot(objects["x"] + x0 - expected_x, objects["y"] + y0 - expected_y)
+    psf_sigma = max(float(psf_fwhm) / 2.354820045, 0.6)
+    compact = (
+        np.isfinite(distance)
+        & (distance <= search_radius)
+        & (minor >= 0.35)
+        & (major <= max(16.0, 8.0 * psf_sigma))
+        & (roundness >= 0.15)
+        & np.isfinite(fwhm)
+        & (fwhm >= 0.7)
+    )
+    indices = np.flatnonzero(compact)
+    if not len(indices):
+        return None
+    aperture = np.clip(1.25 * fwhm[indices], 2.5, 12.0)
+    flux, flux_error, flags = sep.sum_circle(
+        signal,
+        objects["x"][indices],
+        objects["y"][indices],
+        aperture,
+        err=noise,
+        mask=patch_mask,
+        subpix=5,
+    )
+    snr = flux / np.maximum(flux_error, 1e-20)
+    valid_measurements = (
+        np.isfinite(flux)
+        & (flux > 0)
+        & np.isfinite(snr)
+        & (snr >= max(4.0, float(sensitivity) * 0.75))
+        & ((flags & sep.APER_TRUNC) == 0)
+    )
+    snr_values = snr[valid_measurements]
+    flux_values = flux[valid_measurements]
+    indices = indices[valid_measurements]
+    if not len(indices):
+        return None
+    scores = distance[indices] / max(search_radius, 1.0) - 0.02 * np.log1p(np.maximum(snr_values, 0.0))
+    measurement_index = int(np.argmin(scores))
+    index = int(indices[measurement_index])
+    x = float(objects["x"][index] + x0)
+    y = float(objects["y"][index] + y0)
+    return (
+        x,
+        y,
+        float(flux_values[measurement_index]),
+        float(objects["peak"][index]),
+        float(fwhm[index]),
+        float(objects["a"][index]),
+        float(objects["b"][index]),
+        float(objects["theta"][index]),
+        float(snr_values[measurement_index]),
+        float(distance[index]),
+    )
 
 
 def match_local_bright_stars(
@@ -367,10 +519,12 @@ def match_local_bright_stars(
     solver_image_path: str | Path,
     detector_scale_xy: tuple[float, float],
     primary_image_path: str | Path | None = None,
+    relative_magnitude_limit: float = 5.0,
+    sensitivity: float = 4.8,
     progress: Progress | None = None,
-) -> tuple[dict[int, CatalogMatch], int]:
+) -> tuple[dict[int, CatalogMatch], int, list[RecoveredCatalogStar]]:
     """Solve locally and match against ASTAP's bundled Gaia-derived W08 bright-star index."""
-    positions, pixel_scale_arcsec, full_fov_height = _positions_to_sky(
+    positions, pixel_scale_arcsec, full_fov_height, successful_tiles = _positions_to_sky(
         stars,
         detector,
         sky_mask,
@@ -387,8 +541,8 @@ def match_local_bright_stars(
     if catalog_path is None:
         raise RuntimeError("程序包缺少 ASTAP W08 本地亮星索引；请重新下载完整版本并解压。")
     catalog_magnitudes, catalog_vectors = _load_w08_catalog(str(catalog_path.resolve()))
-    if not positions or not len(catalog_magnitudes):
-        return {}, len(positions)
+    if not len(catalog_magnitudes):
+        return {}, len(positions), []
 
     # W08 is an all-sky bright-star subset, complete to approximately G=8.
     # Its catalogue positions and rounded G magnitudes are bundled with the app;
@@ -399,17 +553,18 @@ def match_local_bright_stars(
     # narrow fields retain a tighter tolerance to avoid ambiguous neighbours.
     radius_scale = 5.0 if full_fov_height > 20.0 else 2.0
     query_radius_arcsec = float(np.clip(pixel_scale_arcsec * radius_scale, 10.0, 240.0))
-    source_vectors = _sky_unit_vectors(positions)
     tree = cKDTree(catalog_vectors)
     chord_limit = 2.0 * math.sin(math.radians(query_radius_arcsec / 3600.0) * 0.5)
-    distances, row_indices = tree.query(source_vectors, k=1, distance_upper_bound=chord_limit)
     nearest_pairs: list[tuple[float, int, int]] = []
-    for position, chord, row_index in zip(positions, distances, row_indices):
-        row_index = int(row_index)
-        if row_index >= len(catalog_magnitudes) or not math.isfinite(float(chord)):
-            continue
-        separation_arcsec = math.degrees(2.0 * math.asin(min(float(chord), 2.0) * 0.5)) * 3600.0
-        nearest_pairs.append((separation_arcsec, int(position[0]), row_index))
+    if positions:
+        source_vectors = _sky_unit_vectors(positions)
+        distances, row_indices = tree.query(source_vectors, k=1, distance_upper_bound=chord_limit)
+        for position, chord, row_index in zip(positions, distances, row_indices):
+            row_index = int(row_index)
+            if row_index >= len(catalog_magnitudes) or not math.isfinite(float(chord)):
+                continue
+            separation_arcsec = math.degrees(2.0 * math.asin(min(float(chord), 2.0) * 0.5)) * 3600.0
+            nearest_pairs.append((separation_arcsec, int(position[0]), row_index))
 
     used_detections: set[int] = set()
     used_catalog_sources: set[int] = set()
@@ -424,7 +579,142 @@ def match_local_bright_stars(
         )
         used_detections.add(det_id)
         used_catalog_sources.add(row_index)
-    return matches, len(positions)
+
+    reference_g = min((match.g_mag for match in matches.values()), default=math.inf)
+    maximum_g = min(8.0, reference_g + float(relative_magnitude_limit) + 0.2)
+    if not math.isfinite(reference_g):
+        maximum_g = 8.0
+    detector_scale_x, detector_scale_y = detector_scale_xy
+    detector_pixel_scale = pixel_scale_arcsec / max(math.sqrt(detector_scale_x * detector_scale_y), 1e-8)
+    recovery_radius_px = float(np.clip(query_radius_arcsec / max(detector_pixel_scale, 1e-8), 3.0, 10.0))
+    detected_xy = np.asarray(
+        [(float(getattr(star, "x")), float(getattr(star, "y"))) for star in stars],
+        dtype=np.float64,
+    ).reshape((-1, 2))
+    detection_tree = cKDTree(detected_xy) if len(detected_xy) else None
+    psf_fwhm = float(np.median([float(getattr(star, "fwhm", 3.0)) for star in stars])) if stars else 3.0
+
+    # In wide fields each accepted tile has its own distortion fit. Project the
+    # catalogue back into every tile, prefer predictions furthest from a tile
+    # edge, then inspect nearby image pixels for compact sources SEP missed.
+    projected: dict[int, tuple[float, float, float]] = {}
+    for tile in successful_tiles:
+        tile_width, tile_height = tile.x1 - tile.x0, tile.y1 - tile.y0
+        sample_pixels = np.asarray([
+            [tile_width / 2.0, tile_height / 2.0],
+            [-0.5, -0.5], [tile_width - 0.5, -0.5],
+            [-0.5, tile_height - 0.5], [tile_width - 0.5, tile_height - 0.5],
+            [tile_width / 2.0, -0.5], [tile_width / 2.0, tile_height - 0.5],
+            [-0.5, tile_height / 2.0], [tile_width - 0.5, tile_height / 2.0],
+        ], dtype=np.float64)
+        try:
+            sample_sky = np.asarray(tile.wcs.all_pix2world(sample_pixels, 0), dtype=np.float64)
+        except Exception:
+            continue
+        if sample_sky.shape[0] < 5 or not np.isfinite(sample_sky[0]).all():
+            continue
+        center_ra, center_dec = np.radians(sample_sky[0])
+        center_vector = np.asarray([
+            math.cos(center_dec) * math.cos(center_ra),
+            math.cos(center_dec) * math.sin(center_ra),
+            math.sin(center_dec),
+        ])
+        edge_vectors = _sky_unit_vectors([
+            (i, float(world[0]) % 360.0, float(world[1]))
+            for i, world in enumerate(sample_sky[1:])
+            if np.isfinite(world).all() and -90.0 <= world[1] <= 90.0
+        ])
+        if not len(edge_vectors):
+            continue
+        edge_angles = np.degrees(np.arccos(np.clip(edge_vectors @ center_vector, -1.0, 1.0)))
+        cone_radius = min(175.0, float(np.max(edge_angles)) + 4.0)
+        cone_chord = 2.0 * math.sin(math.radians(cone_radius) * 0.5)
+        catalog_rows = np.asarray(tree.query_ball_point(center_vector, cone_chord), dtype=np.int64)
+        if not len(catalog_rows):
+            continue
+        catalog_rows = catalog_rows[catalog_magnitudes[catalog_rows] <= maximum_g]
+        if not len(catalog_rows):
+            continue
+        vectors = catalog_vectors[catalog_rows]
+        ras = np.degrees(np.arctan2(vectors[:, 1], vectors[:, 0])) % 360.0
+        decs = np.degrees(np.arcsin(np.clip(vectors[:, 2], -1.0, 1.0)))
+        world = np.column_stack((ras, decs))
+        try:
+            tile_pixels = np.asarray(tile.wcs.all_world2pix(world, 0, quiet=True), dtype=np.float64)
+        except Exception:
+            continue
+        finite = np.isfinite(tile_pixels).all(axis=1)
+        inside = (
+            finite
+            & (tile_pixels[:, 0] >= -recovery_radius_px)
+            & (tile_pixels[:, 0] <= tile_width + recovery_radius_px)
+            & (tile_pixels[:, 1] >= -recovery_radius_px)
+            & (tile_pixels[:, 1] <= tile_height + recovery_radius_px)
+        )
+        for local, row in enumerate(catalog_rows[inside]):
+            px, py = tile_pixels[inside][local]
+            edge_margin = min(
+                px / max(tile_width, 1), (tile_width - px) / max(tile_width, 1),
+                py / max(tile_height, 1), (tile_height - py) / max(tile_height, 1),
+            )
+            full_x, full_y = tile.x0 + float(px), tile.y0 + float(py)
+            previous = projected.get(int(row))
+            if previous is None or edge_margin > previous[0]:
+                projected[int(row)] = (edge_margin, full_x / detector_scale_x, full_y / detector_scale_y)
+
+    recovered: list[RecoveredCatalogStar] = []
+    recovered_xy = np.empty((0, 2), dtype=np.float64)
+    for row_index, (_edge_margin, expected_x, expected_y) in projected.items():
+        if row_index in used_catalog_sources:
+            continue
+        ra = math.degrees(math.atan2(catalog_vectors[row_index, 1], catalog_vectors[row_index, 0])) % 360.0
+        dec = math.degrees(math.asin(float(np.clip(catalog_vectors[row_index, 2], -1.0, 1.0))))
+        if detection_tree is not None:
+            distance, det_id = detection_tree.query([expected_x, expected_y], k=1)
+            det_id = int(det_id)
+            if float(distance) <= recovery_radius_px and det_id not in used_detections:
+                matches[det_id] = CatalogMatch(
+                    None, ra, dec, float(catalog_magnitudes[row_index]), None, None,
+                    float(distance) * detector_pixel_scale,
+                )
+                used_detections.add(det_id)
+                used_catalog_sources.add(row_index)
+                continue
+            if float(distance) <= recovery_radius_px and det_id in used_detections:
+                continue
+
+        local_source = _recover_catalog_source_near_pixel(
+            detector,
+            sky_mask,
+            expected_x,
+            expected_y,
+            recovery_radius_px,
+            psf_fwhm,
+            sensitivity,
+        )
+        if local_source is None:
+            continue
+        x, y, flux, peak, fwhm, axis_a, axis_b, theta, snr, separation_px = local_source
+        if len(recovered_xy):
+            duplicate_radius = max(2.0, min(float(fwhm), 5.0))
+            if float(np.min(np.hypot(recovered_xy[:, 0] - x, recovered_xy[:, 1] - y))) < duplicate_radius:
+                continue
+        recovered.append(RecoveredCatalogStar(
+            float(catalog_magnitudes[row_index]),
+            x,
+            y,
+            flux,
+            peak,
+            fwhm,
+            axis_a,
+            axis_b,
+            theta,
+            snr,
+            separation_px * detector_pixel_scale,
+        ))
+        recovered_xy = np.vstack((recovered_xy, [x, y]))
+        used_catalog_sources.add(row_index)
+    return matches, len(positions), recovered
 
 
 def _sky_unit_vectors(positions: Sequence[tuple[int, float, float]]) -> np.ndarray:

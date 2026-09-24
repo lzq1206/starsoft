@@ -56,7 +56,7 @@ def _update_job(job_id: str, **values: object) -> None:
             job.update(values)
 
 
-def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str, float]) -> None:
+def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str, float | str]) -> None:
     def report(percent: int, message: str) -> None:
         _update_job(job_id, percent=10 + int(percent * 0.9), message=message)
 
@@ -92,6 +92,8 @@ def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str,
             stars=result.star_count,
             candidates=result.candidate_count,
             catalogMatches=result.catalog_match_count,
+            recoveredCatalogStars=result.recovered_catalog_star_count,
+            brightnessSource=result.brightness_source,
             selectedCount=result.selected_count,
             relativeMagnitudeLimit=round(result.relative_magnitude_limit, 1),
             width=result.width,
@@ -272,7 +274,8 @@ def _make_handler(token: str):
                     "sensitivity": float(query.get("sensitivity", ["4.8"])[0]),
                     "strength": float(query.get("strength", ["10"])[0]),
                     "opacity": float(query.get("opacity", ["30"])[0]),
-                    "relative_magnitude_limit": float(query.get("relative_magnitude_limit", ["3.0"])[0]),
+                    "brightness_source": str(query.get("brightness_source", ["catalog"])[0]),
+                    "relative_magnitude_limit": float(query.get("relative_magnitude_limit", ["5.0"])[0]),
                     "min_radius": float(query.get("min_radius", ["3"])[0]),
                     "max_radius": float(query.get("max_radius", ["42"])[0]),
                 }
@@ -282,6 +285,8 @@ def _make_handler(token: str):
             params["sensitivity"] = min(max(params["sensitivity"], 2.0), 10.0)
             params["strength"] = min(max(params["strength"], 0.0), 30.0)
             params["opacity"] = min(max(params["opacity"], 0.0), 100.0)
+            if params["brightness_source"] not in {"catalog", "image"}:
+                raise ValueError("星点亮度来源无效")
             params["relative_magnitude_limit"] = min(max(params["relative_magnitude_limit"], 0.0), 10.0)
             params["min_radius"] = min(max(params["min_radius"], 2.0), 24.0)
             params["max_radius"] = min(max(params["max_radius"], 8.0), 80.0)
