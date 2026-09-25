@@ -27,7 +27,8 @@ mkdir -p "$DIST_DIR" "$WORK_DIR" "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${
   --distpath "$DIST_DIR" --workpath "$WORK_DIR" \
   --collect-all rawpy --collect-all sep --collect-all tifffile \
   --collect-all astropy --collect-all seiza \
-  --add-data "$ROOT_DIR/ui/index.html:ui" "$ROOT_DIR/app.py"
+  --add-data "$ROOT_DIR/ui/index.html:ui" \
+  --add-data "$ROOT_DIR/data/hyg_named_stars.csv:data" "$ROOT_DIR/app.py"
 
 test -d "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/Resources"
@@ -38,6 +39,7 @@ cp "$ROOT_DIR/README.md" "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${ARCH}/"
 cp "$ROOT_DIR/LICENSE" "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${ARCH}/"
 cp "$ROOT_DIR/licenses/Seiza-Apache-2.0.txt" "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${ARCH}/"
 cp "$ROOT_DIR/licenses/THIRD_PARTY_NOTICES.txt" "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${ARCH}/"
+cp "$ROOT_DIR/licenses/CC-BY-SA-4.0.txt" "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${ARCH}/"
 cat > "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${ARCH}/首次运行说明.txt" <<'EOF'
 首次打开时，在 Finder 中按住 Control 并点按“星点柔焦.app”，选择“打开”。
 该应用由 GitHub Actions 构建，目前未使用 Apple Developer ID 签名或公证。

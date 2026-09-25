@@ -13,6 +13,8 @@ on:
       - "version.py"
       - "README.md"
       - "LICENSE"
+      - "data/**"
+      - "licenses/**"
       - "build_macos.sh"
       - "build.ps1"
       - ".github/workflows/macos.yml"

@@ -18,10 +18,10 @@ import rawpy
 import sep
 import tifffile
 from scipy.ndimage import gaussian_filter, zoom
-from PIL import ExifTags, Image, ImageCms, ImageOps
+from PIL import ExifTags, Image, ImageCms, ImageDraw, ImageFont, ImageOps
 
 from version import APP_VERSION
-from plate_solver import match_local_bright_stars
+from plate_solver import CatalogCoverageArea, CatalogPosition, match_local_bright_stars
 
 
 Progress = Callable[[int, str], None]
@@ -77,6 +77,9 @@ class Star:
     catalog_source_id: int | None = None
     catalog_delta_magnitude: float | None = None
     catalog_position_recovered: bool = False
+    catalog_name: str | None = None
+    catalog_ra_deg: float | None = None
+    catalog_dec_deg: float | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,11 @@ class ProcessResult:
     sky_background_level: float
     sky_adaptation_gain: float
     comparison_preview: bytes | None = None
+    comparison_star_count: int = 0
+    coverage_preview: bytes | None = None
+    catalog_prediction_count: int = 0
+    catalog_verified_count: int = 0
+    catalog_unverified_count: int = 0
     analysis: PreparedAnalysis | None = None
 
 
@@ -146,6 +154,8 @@ class PreparedAnalysis:
     raw_acr_reference_median: float | None
     raw_acr_reference_name: str | None
     raw_brightness_calibration_method: str
+    catalog_positions: tuple[CatalogPosition, ...] = ()
+    catalog_coverage_areas: tuple[CatalogCoverageArea, ...] = ()
 
 
 def _clean_text(value: object) -> str:
@@ -1257,6 +1267,9 @@ def _soften_stars(
             "aperture_flux_image_units": round(float(star.image_flux if star.image_flux is not None else star.flux), 7),
             "catalog_source_id": star.catalog_source_id,
             "catalog_g_magnitude": round(float(star.catalog_g_mag), 1) if star.catalog_g_mag is not None else None,
+            "catalog_name": star.catalog_name,
+            "catalog_ra_deg": round(float(star.catalog_ra_deg), 7) if star.catalog_ra_deg is not None else None,
+            "catalog_dec_deg": round(float(star.catalog_dec_deg), 7) if star.catalog_dec_deg is not None else None,
             "catalog_bp_rp_colour_index": round(float(star.catalog_bp_rp), 5) if star.catalog_bp_rp is not None else None,
             "gaia_delta_g_from_brightest": round(float(star.catalog_delta_magnitude), 5) if star.catalog_delta_magnitude is not None else None,
             "catalog_position_recovered_from_wcs": bool(star.catalog_position_recovered),
@@ -1350,38 +1363,87 @@ def _select_stars(
     return image_stars, len(image_stars), None, 0
 
 
-def _brightest_star_crop(
+def _brightest_star_crops(
     image_data: np.ndarray,
     stars: list[Star],
     detector_shape: tuple[int, int],
     brightness_source: str,
     max_radius: float,
-) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+    limit: int = 3,
+) -> list[tuple[tuple[int, int, int, int], np.ndarray, Star, str]]:
     if not stars:
-        return None
-    brightest = min(
-        stars,
-        key=(lambda star: star.catalog_g_mag if star.catalog_g_mag is not None else math.inf)
-        if brightness_source == "catalog"
-        else (lambda star: -star.flux),
-    )
+        return []
+    if brightness_source == "catalog":
+        ranked_stars = sorted(
+            stars,
+            key=lambda star: (
+                star.catalog_g_mag if star.catalog_g_mag is not None else math.inf,
+                -star.flux,
+                star.y,
+                star.x,
+            ),
+        )
+    else:
+        ranked_stars = sorted(stars, key=lambda star: (-star.flux, star.y, star.x))
     height, width = image_data.shape[:2]
     scale_x, scale_y = width / detector_shape[1], height / detector_shape[0]
-    center_x = int(round((brightest.x + 0.5) * scale_x - 0.5))
-    center_y = int(round((brightest.y + 0.5) * scale_y - 0.5))
     half = int(np.clip(math.ceil(max(64.0, max_radius * 2.5)), 64, 256))
-    x0, x1 = max(0, center_x - half), min(width, center_x + half + 1)
-    y0, y1 = max(0, center_y - half), min(height, center_y + half + 1)
-    return (x0, y0, x1, y1), np.array(image_data[y0:y1, x0:x1], dtype=np.float32, copy=True)
+    crop_size = 2 * half + 1
+    bright_count = min(max(1, int(limit)), len(ranked_stars))
+    selected: list[tuple[Star, str, int]] = [
+        (star, "BRIGHT", index + 1)
+        for index, star in enumerate(ranked_stars[:bright_count])
+    ]
+    bright_keys = {(round(star.x, 3), round(star.y, 3)) for star in ranked_stars[:bright_count]}
+    faint_stars = [
+        star for star in reversed(ranked_stars[-bright_count:])
+        if (round(star.x, 3), round(star.y, 3)) not in bright_keys
+    ]
+    selected.extend(
+        (star, "FAINT", index + 1) for index, star in enumerate(faint_stars)
+    )
+    result: list[tuple[tuple[int, int, int, int], np.ndarray, Star, str]] = []
+    for star, section, section_index in selected:
+        center_x = int(round((star.x + 0.5) * scale_x - 0.5))
+        center_y = int(round((star.y + 0.5) * scale_y - 0.5))
+        center_x = int(np.clip(center_x, 0, width - 1))
+        center_y = int(np.clip(center_y, 0, height - 1))
+        x0, y0 = center_x - half, center_y - half
+        x1, y1 = x0 + crop_size, y0 + crop_size
+        source_x0, source_y0 = max(0, x0), max(0, y0)
+        source_x1, source_y1 = min(width, x1), min(height, y1)
+        crop = np.array(image_data[source_y0:source_y1, source_x0:source_x1], dtype=np.float32, copy=True)
+        padding = (
+            (source_y0 - y0, y1 - source_y1),
+            (source_x0 - x0, x1 - source_x1),
+        )
+        if crop.ndim > 2:
+            padding += ((0, 0),) * (crop.ndim - 2)
+        if any(before or after for before, after in padding):
+            crop = np.pad(crop, padding, mode="edge")
+        if crop.shape[0] != crop_size or crop.shape[1] != crop_size:
+            continue
+        if brightness_source == "catalog" and star.catalog_g_mag is not None:
+            brightness = f"G={star.catalog_g_mag:.1f}"
+            if star.catalog_delta_magnitude is not None:
+                brightness += f" dG={star.catalog_delta_magnitude:.1f}"
+        else:
+            delta_m = -2.5 * math.log10(max(float(star.relative_flux_ratio), 1e-20))
+            brightness = f"dm={delta_m:.1f} mag"
+        name = star.catalog_name or f"SEP source {section_index}"
+        caption = f"{section} {section_index} | {name[:36]} | {brightness}"
+        result.append(((x0, y0, x1, y1), crop, star, caption))
+    return result
 
 
 def _comparison_jpeg(
-    before: np.ndarray | None,
-    after: np.ndarray | None,
+    before_crops: list[np.ndarray],
+    after_crops: list[np.ndarray],
+    captions: list[str],
     profile: bytes | None,
-) -> bytes | None:
-    if before is None or after is None:
-        return None
+) -> tuple[bytes | None, int]:
+    if not before_crops or len(before_crops) != len(after_crops) or len(before_crops) != len(captions):
+        return None, 0
 
     def to_rgb8(pixels: np.ndarray) -> np.ndarray:
         pixels = np.asarray(pixels, dtype=np.float32)
@@ -1392,21 +1454,157 @@ def _comparison_jpeg(
         pixels = np.clip(pixels[..., :3], 0.0, 1.0)
         return np.rint(pixels * 255.0).astype(np.uint8)
 
-    left, right = to_rgb8(before), to_rgb8(after)
-    height = min(left.shape[0], right.shape[0])
-    width = min(left.shape[1], right.shape[1])
-    if height < 8 or width < 8:
-        return None
-    left, right = left[:height, :width], right[:height, :width]
-    panel = np.zeros((height, width * 2 + 5, 3), dtype=np.uint8)
-    panel[:, :width] = left
-    panel[:, width + 5:] = right
+    panels: list[np.ndarray] = []
+    label_height = 22
+    for before, after, caption in zip(before_crops, after_crops, captions):
+        left, right = to_rgb8(before), to_rgb8(after)
+        height = min(left.shape[0], right.shape[0])
+        width = min(left.shape[1], right.shape[1])
+        if height < 8 or width < 8:
+            continue
+        left, right = left[:height, :width], right[:height, :width]
+        panel = np.full((height + label_height, width * 2 + 5, 3), 9, dtype=np.uint8)
+        panel[label_height:, :width] = left
+        panel[label_height:, width + 5:] = right
+        canvas = Image.fromarray(panel, mode="RGB")
+        draw = ImageDraw.Draw(canvas)
+        font = ImageFont.load_default(size=13)
+        draw.text((5, 4), caption, fill=(230, 222, 246), font=font)
+        panel = np.asarray(canvas, dtype=np.uint8)
+        panels.append(panel)
+    if not panels:
+        return None, 0
+    row_gap = 5
+    panel_width = max(panel.shape[1] for panel in panels)
+    panel_height = sum(panel.shape[0] for panel in panels) + row_gap * (len(panels) - 1)
+    montage = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
+    y = 0
+    for panel in panels:
+        montage[y:y + panel.shape[0], :panel.shape[1]] = panel
+        y += panel.shape[0] + row_gap
     buffer = BytesIO()
     options: dict[str, object] = {"format": "JPEG", "quality": 92, "optimize": True}
     if profile:
         options["icc_profile"] = profile
-    Image.fromarray(panel, mode="RGB").save(buffer, **options)
-    return buffer.getvalue()
+    Image.fromarray(montage, mode="RGB").save(buffer, **options)
+    return buffer.getvalue(), len(panels)
+
+
+def _coverage_svg(
+    detector_shape: tuple[int, int],
+    detector_stars: list[Star],
+    catalog_positions: tuple[CatalogPosition, ...],
+    coverage_areas: tuple[CatalogCoverageArea, ...],
+    relative_magnitude_limit: float,
+    catalog_reference_g_mag: float | None,
+) -> tuple[bytes, int, int, int]:
+    """Draw image detections and catalog-projected candidates without conflating them."""
+    height, width = detector_shape
+    reference_g = catalog_reference_g_mag
+    if reference_g is None:
+        reference_g = min(
+            (position.g_mag for position in catalog_positions if position.state in {"detected", "recovered"}),
+            default=min((position.g_mag for position in catalog_positions), default=math.inf),
+        )
+    if math.isfinite(reference_g):
+        magnitude_ceiling = reference_g + max(0.0, float(relative_magnitude_limit))
+        catalog_positions = tuple(
+            position for position in catalog_positions
+            if position.g_mag <= magnitude_ceiling + 1e-9
+        )
+    else:
+        catalog_positions = ()
+    frame_width = 540.0
+    frame_height = frame_width * height / max(width, 1)
+    if frame_height > 310.0:
+        frame_height = 310.0
+        frame_width = frame_height * width / max(height, 1)
+    frame_x = (600.0 - frame_width) * 0.5
+    frame_y = 54.0 + (310.0 - frame_height) * 0.5
+    columns, rows = 4, 3
+    cell_width, cell_height = frame_width / columns, frame_height / rows
+    bins: dict[tuple[int, int], list[int]] = {}
+    for position in catalog_positions:
+        if not (math.isfinite(position.x) and math.isfinite(position.y)):
+            continue
+        if not (0.0 <= position.x < width and 0.0 <= position.y < height):
+            continue
+        column = min(columns - 1, max(0, int(position.x * columns / max(width, 1))))
+        row = min(rows - 1, max(0, int(position.y * rows / max(height, 1))))
+        counts = bins.setdefault((column, row), [0, 0])
+        counts[1] += 1
+        counts[0] += int(position.state in {"detected", "recovered"})
+
+    svg: list[str] = [
+        '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="420" viewBox="0 0 600 420">',
+        '<rect width="600" height="420" rx="12" fill="#0a0b10"/>',
+        '<text x="18" y="24" fill="#d7c9f5" font-family="Segoe UI, sans-serif" font-size="12" font-weight="600">IMAGE FRAME · 4 × 3 COVERAGE</text>',
+        f'<text x="18" y="42" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">W08 G ≤ {magnitude_ceiling:.1f} | cell: confirmed / projected | blue outline: model only</text>' if math.isfinite(reference_g) else '<text x="18" y="42" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">Image detections only | no validated catalog projection</text>',
+        f'<rect x="{frame_x:.2f}" y="{frame_y:.2f}" width="{frame_width:.2f}" height="{frame_height:.2f}" rx="2" fill="#11151e" stroke="#68617f" stroke-width="1.4"/>',
+    ]
+    for area in coverage_areas:
+        x0 = frame_x + np.clip(area.x0, 0.0, width) * frame_width / max(width, 1)
+        y0 = frame_y + np.clip(area.y0, 0.0, height) * frame_height / max(height, 1)
+        x1 = frame_x + np.clip(area.x1, 0.0, width) * frame_width / max(width, 1)
+        y1 = frame_y + np.clip(area.y1, 0.0, height) * frame_height / max(height, 1)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        if area.source == "camera projection":
+            style = 'fill="#7998e8" fill-opacity="0.08" stroke="#91aaff" stroke-opacity="0.75" stroke-dasharray="5 4"'
+        else:
+            style = 'fill="#67b9dc" fill-opacity="0.11" stroke="#74c7e6" stroke-opacity="0.85"'
+        svg.append(f'<rect x="{x0:.2f}" y="{y0:.2f}" width="{x1 - x0:.2f}" height="{y1 - y0:.2f}" {style}/>')
+    for row in range(rows):
+        for column in range(columns):
+            confirmed, total = bins.get((column, row), (0, 0))
+            if total == 0:
+                fill, opacity, label = "#171c27", 0.9, "—"
+            else:
+                ratio = confirmed / total
+                fill = "#54c89d" if ratio >= 0.8 else "#e3ae58" if ratio >= 0.4 else "#d56c74"
+                opacity = 0.15 + 0.18 * ratio
+                label = f"{confirmed}/{total}"
+            x, y = frame_x + column * cell_width, frame_y + row * cell_height
+            svg.append(
+                f'<rect x="{x:.2f}" y="{y:.2f}" width="{cell_width:.2f}" height="{cell_height:.2f}" fill="{fill}" fill-opacity="{opacity:.2f}" stroke="#43495a" stroke-width="0.8"/>'
+            )
+            svg.append(
+                f'<text x="{x + 5:.2f}" y="{y + 14:.2f}" fill="#eef0f8" font-family="Segoe UI, sans-serif" font-size="10">{label}</text>'
+            )
+
+    def map_point(x: float, y: float) -> tuple[float, float] | None:
+        if not (math.isfinite(x) and math.isfinite(y) and 0 <= x < width and 0 <= y < height):
+            return None
+        return frame_x + x * frame_width / max(width, 1), frame_y + y * frame_height / max(height, 1)
+
+    # Faint image detections show the locations that SEP actually measured.
+    for star in detector_stars:
+        point = map_point(star.x, star.y)
+        if point is not None:
+            svg.append(f'<circle cx="{point[0]:.2f}" cy="{point[1]:.2f}" r="0.95" fill="#d7dbe8" fill-opacity="0.42"/>')
+    for position in catalog_positions:
+        point = map_point(position.x, position.y)
+        if point is None:
+            continue
+        x, y = point
+        if position.state == "detected":
+            svg.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="2.25" fill="#c1a4ff" stroke="#090b11" stroke-width="0.7"/>')
+        elif position.state == "recovered":
+            svg.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.0" fill="#68e0b4" stroke="#090b11" stroke-width="0.8"/>')
+        else:
+            svg.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.2" fill="none" stroke="#f2bd66" stroke-width="1.5"/>')
+    if not catalog_positions:
+        svg.append(
+            '<text x="18" y="405" fill="#d4be93" font-family="Segoe UI, sans-serif" font-size="10">No catalog projection; dots show image detections only.</text>'
+        )
+    else:
+        svg.append(
+            '<text x="18" y="405" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">Empty cells have no projected W08 candidate; they do not certify star-free sky.</text>'
+        )
+    svg.append("</svg>")
+    verified = sum(position.state in {"detected", "recovered"} for position in catalog_positions)
+    unverified = sum(position.state == "predicted" for position in catalog_positions)
+    return "".join(svg).encode("utf-8"), len(catalog_positions), verified, unverified
 
 
 def process_raw(
@@ -1633,10 +1831,14 @@ def process_raw(
             metadata_callback(info)
     detector_stars = list(prepared_analysis.detector_stars) if prepared_analysis is not None else list(stars)
     catalog_entries: list[tuple[Star, float, bool]] = []
+    catalog_positions: tuple[CatalogPosition, ...] = ()
+    catalog_coverage_areas: tuple[CatalogCoverageArea, ...] = ()
     catalog_position_count = 0
     catalog_match_count = 0
     if prepared_analysis is not None:
         catalog_entries = list(prepared_analysis.catalog_entries)
+        catalog_positions = prepared_analysis.catalog_positions
+        catalog_coverage_areas = prepared_analysis.catalog_coverage_areas
         catalog_position_count = prepared_analysis.catalog_position_count
         catalog_match_count = prepared_analysis.catalog_match_count
     elif brightness_source == "catalog":
@@ -1663,7 +1865,13 @@ def process_raw(
         with tempfile.TemporaryDirectory(prefix="starsoft-solver-image-") as solver_directory:
             solver_image_path = Path(solver_directory) / "solver_16bit.tif"
             _write_solver_grayscale(image_data, solver_image_path, sky_mask)
-            catalog_matches, catalog_position_count, recovered_sources = match_local_bright_stars(
+            (
+                catalog_matches,
+                catalog_position_count,
+                recovered_sources,
+                catalog_positions,
+                catalog_coverage_areas,
+            ) = match_local_bright_stars(
                 detector_stars,
                 detector,
                 sky_mask,
@@ -1679,7 +1887,13 @@ def process_raw(
             )
         catalog_match_count = len(catalog_matches) + len(recovered_sources)
         catalog_entries = [
-            (detector_stars[index], match.g_mag, False)
+            (replace(
+                detector_stars[index],
+                catalog_g_mag=match.g_mag,
+                catalog_name=match.name,
+                catalog_ra_deg=match.ra_deg,
+                catalog_dec_deg=match.dec_deg,
+            ), match.g_mag, False)
             for index, match in catalog_matches.items()
             if 0 <= index < len(detector_stars)
         ]
@@ -1697,6 +1911,15 @@ def process_raw(
                 source.signal_to_noise,
                 False,
                 source.flux,
+                source.g_mag,
+                None,
+                None,
+                None,
+                None,
+                False,
+                source.name,
+                source.ra_deg,
+                source.dec_deg,
             ),
             source.g_mag,
             True,
@@ -1705,12 +1928,33 @@ def process_raw(
     stars, selected_count, catalog_reference_g_mag, recovered_catalog_star_count = _select_stars(
         detector_stars, catalog_entries, brightness_source, relative_magnitude_limit
     )
-    report(
-        61,
-        f"{'本机星表匹配' if brightness_source == 'catalog' else 'SEP 检出'} "
-        f"{catalog_match_count if brightness_source == 'catalog' else candidate_count:,} 个候选，"
-        f"其中 {selected_count:,} 个符合亮度范围，正在柔焦…",
+    coverage_reference_g_mag = catalog_reference_g_mag
+    if coverage_reference_g_mag is None:
+        coverage_reference_g_mag = min(
+            (position.g_mag for position in catalog_positions if position.state in {"detected", "recovered"}),
+            default=None,
+        )
+    coverage_magnitude_ceiling = (
+        coverage_reference_g_mag + relative_magnitude_limit
+        if coverage_reference_g_mag is not None else None
     )
+    in_range_catalog_positions = tuple(
+        position for position in catalog_positions
+        if coverage_magnitude_ceiling is not None
+        and position.g_mag <= coverage_magnitude_ceiling + 1e-9
+    )
+    catalog_verified_count = sum(position.state in {"detected", "recovered"} for position in in_range_catalog_positions)
+    catalog_unverified_count = sum(position.state == "predicted" for position in in_range_catalog_positions)
+    if brightness_source == "catalog":
+        report(
+            61,
+            f"SEP 实测 {candidate_count:,} 个点源候选；ΔG≤{relative_magnitude_limit:.1f} 的星表候选 "
+            f"{len(in_range_catalog_positions):,} 个，"
+            f"图像确认 {catalog_verified_count:,} 个，另 {catalog_unverified_count:,} 个无点源证据、不柔焦；"
+            f"本次柔焦 {selected_count:,} 个…",
+        )
+    else:
+        report(61, f"SEP 图像实测 {candidate_count:,} 个点源候选，其中 {selected_count:,} 个符合亮度范围，正在柔焦…")
     detector_shape = prepared_analysis.detector_shape if prepared_analysis is not None else detector.shape
 
     analysis = prepared_analysis
@@ -1764,6 +2008,8 @@ def process_raw(
                 raw_acr_reference_median=raw_acr_reference_median,
                 raw_acr_reference_name=raw_acr_reference_name,
                 raw_brightness_calibration_method=raw_brightness_calibration_method,
+                catalog_positions=tuple(catalog_positions),
+                catalog_coverage_areas=tuple(catalog_coverage_areas),
             )
         except (OSError, ValueError, MemoryError):
             analysis = None
@@ -1771,11 +2017,11 @@ def process_raw(
             if alpha_cache_path is not None:
                 alpha_cache_path.unlink(missing_ok=True)
 
-    brightest_crop = _brightest_star_crop(
+    brightest_crops = _brightest_star_crops(
         image_data, stars, detector_shape, brightness_source, max_radius
     )
-    crop_box = brightest_crop[0] if brightest_crop is not None else None
-    before_crop = brightest_crop[1] if brightest_crop is not None else None
+    before_crops = [item[1] for item in brightest_crops]
+    comparison_captions = [item[3] for item in brightest_crops]
     star_measurements = _soften_stars(
         image_data,
         stars,
@@ -1792,17 +2038,38 @@ def process_raw(
     report(92, "正在写入 16 位 TIFF…")
     if input_kind == "RAW" or linear_srgb:
         _linear_to_srgb_inplace(image_data)
-        if before_crop is not None:
+        for before_crop in before_crops:
             _linear_to_srgb_inplace(before_crop)
     if invert_gray:
         np.subtract(1.0, image_data, out=image_data)
-        if before_crop is not None:
+        for before_crop in before_crops:
             np.subtract(1.0, before_crop, out=before_crop)
-    after_crop = None
-    if crop_box is not None:
+    after_crops: list[np.ndarray] = []
+    image_height, image_width = image_data.shape[:2]
+    for crop_box, _before_crop, _star, _caption in brightest_crops:
         x0, y0, x1, y1 = crop_box
-        after_crop = np.array(image_data[y0:y1, x0:x1], dtype=np.float32, copy=True)
-    comparison_preview = _comparison_jpeg(before_crop, after_crop, profile)
+        source_x0, source_y0 = max(0, x0), max(0, y0)
+        source_x1, source_y1 = min(image_width, x1), min(image_height, y1)
+        crop = np.array(image_data[source_y0:source_y1, source_x0:source_x1], dtype=np.float32, copy=True)
+        padding = ((source_y0 - y0, y1 - source_y1), (source_x0 - x0, x1 - source_x1))
+        if crop.ndim > 2:
+            padding += ((0, 0),) * (crop.ndim - 2)
+        if any(before or after for before, after in padding):
+            crop = np.pad(crop, padding, mode="edge")
+        after_crops.append(crop)
+    comparison_preview, comparison_star_count = _comparison_jpeg(
+        before_crops, after_crops, comparison_captions, profile
+    )
+    coverage_positions = analysis.catalog_positions if analysis is not None else tuple(catalog_positions)
+    coverage_areas = analysis.catalog_coverage_areas if analysis is not None else tuple(catalog_coverage_areas)
+    coverage_preview, catalog_prediction_count, catalog_verified_count, catalog_unverified_count = _coverage_svg(
+        detector_shape,
+        detector_stars,
+        coverage_positions,
+        coverage_areas,
+        relative_magnitude_limit,
+        catalog_reference_g_mag,
+    )
     # The working buffer remains float32 until this final 16-bit export step.
     # Clamp all formats here so additive halos cannot wrap uint16 highlights.
     np.clip(image_data, 0.0, 1.0, out=image_data)
@@ -1841,8 +2108,13 @@ def process_raw(
         "catalog_match_count": catalog_match_count,
         "catalog_position_recovered_count": recovered_catalog_star_count,
         "catalog_position_count_checked_locally": catalog_position_count,
+        "catalog_projected_candidate_count": catalog_prediction_count,
+        "catalog_image_confirmed_candidate_count": catalog_verified_count,
+        "catalog_unconfirmed_projected_candidate_count_not_softened": catalog_unverified_count,
         "catalog_reference_g_magnitude": round(catalog_reference_g_mag, 5) if catalog_reference_g_mag is not None else None,
-        "catalog_photometry_fields": ["Gaia-derived G magnitude (W08, 0.1 mag resolution)"] if brightness_source == "catalog" else [],
+        "catalog_photometry_fields": ["Gaia-derived G magnitude (W08, 0.1 mag resolution)" ] if brightness_source == "catalog" else [],
+        "catalog_name_source": "HYG v4.1 common names/Bayer-Flamsteed designations matched to W08 sky coordinates; RA/Dec fallback where no name matches" if brightness_source == "catalog" else None,
+        "partial_coverage_policy": "WCS/catalog predictions without a local compact-source image signal appear in the coverage map but are not softened. Direct SEP sources and catalog-position-guided local SEP recoveries are softened if their measured W08 G is within the selected delta range.",
         "relative_magnitude_limit": relative_magnitude_limit,
         "relative_flux_floor_ratio": round(10.0 ** (-0.4 * relative_magnitude_limit), 8),
         "relative_magnitude_difference_definition": (
@@ -1928,5 +2200,10 @@ def process_raw(
         sky_background_level=sky_background_level,
         sky_adaptation_gain=float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)),
         comparison_preview=comparison_preview,
+        comparison_star_count=comparison_star_count,
+        coverage_preview=coverage_preview,
+        catalog_prediction_count=catalog_prediction_count,
+        catalog_verified_count=catalog_verified_count,
+        catalog_unverified_count=catalog_unverified_count,
         analysis=analysis,
     )

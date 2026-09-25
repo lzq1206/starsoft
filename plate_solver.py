@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import csv
 import json
 import math
 import os
@@ -163,6 +164,8 @@ class CatalogMatch:
     bp_mag: float | None
     rp_mag: float | None
     separation_arcsec: float
+    catalog_row_index: int | None = None
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +181,98 @@ class RecoveredCatalogStar:
     theta: float
     signal_to_noise: float
     separation_arcsec: float
+    catalog_row_index: int = -1
+    ra_deg: float = 0.0
+    dec_deg: float = 0.0
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class CatalogPosition:
+    """A Gaia-derived W08 position, with image evidence kept explicit."""
+
+    x: float
+    y: float
+    g_mag: float
+    state: str
+    ra_deg: float
+    dec_deg: float
+    name: str
+    projection_source: str = ""
+
+
+@dataclass(frozen=True)
+class CatalogCoverageArea:
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    source: str
+
+
+@lru_cache(maxsize=1)
+def _load_named_star_rows() -> tuple[tuple[float, float, str, str], ...]:
+    roots = [Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))]
+    roots.append(Path(__file__).resolve().parent)
+    catalog_path = next(
+        (root / "data" / "hyg_named_stars.csv" for root in roots
+         if (root / "data" / "hyg_named_stars.csv").is_file()),
+        None,
+    )
+    if catalog_path is None:
+        return ()
+    rows: list[tuple[float, float, str, str]] = []
+    try:
+        with catalog_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    ra = float(row["ra_deg_j2000"])
+                    dec = float(row["dec_deg_j2000"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not (math.isfinite(ra) and math.isfinite(dec) and 0.0 <= ra < 360.0 and -90.0 <= dec <= 90.0):
+                    continue
+                proper = str(row.get("proper_name") or "").strip()
+                designation = str(row.get("designation") or "").strip()
+                label = proper or designation
+                if label:
+                    rows.append((ra, dec, label, proper))
+    except OSError:
+        return ()
+    return tuple(rows)
+
+
+@lru_cache(maxsize=1)
+def _named_star_tree() -> tuple[cKDTree | None, np.ndarray]:
+    rows = _load_named_star_rows()
+    if not rows:
+        return None, np.empty((0, 3), dtype=np.float64)
+    vectors = _world_unit_vectors(np.asarray([[row[0], row[1]] for row in rows], dtype=np.float64))
+    return cKDTree(vectors), vectors
+
+
+def _named_star_label(ra_deg: float, dec_deg: float) -> str:
+    rows = _load_named_star_rows()
+    tree, vectors = _named_star_tree()
+    if tree is not None and len(rows):
+        target = _world_unit_vectors(np.asarray([[ra_deg, dec_deg]], dtype=np.float64))[0]
+        distance, index = tree.query(target, k=1)
+        # HYG J2000 positions and Gaia DR3-era W08 coordinates can differ by
+        # proper motion. Keep the match local enough to avoid naming a neighbour.
+        if float(distance) <= 2.0 * math.sin(math.radians(60.0 / 3600.0) * 0.5):
+            return rows[int(index)][2]
+    ra_hours = (float(ra_deg) % 360.0) / 15.0
+    hour = int(ra_hours)
+    minute_value = (ra_hours - hour) * 60.0
+    minute = int(minute_value)
+    second = (minute_value - minute) * 60.0
+    sign = "+" if dec_deg >= 0 else "-"
+    abs_dec = abs(float(dec_deg))
+    dec_degree = int(abs_dec)
+    dec_minute_value = (abs_dec - dec_degree) * 60.0
+    dec_minute = int(dec_minute_value)
+    dec_second = (dec_minute_value - dec_minute) * 60.0
+    return f"RA {hour:02d}:{minute:02d}:{second:04.1f} Dec {sign}{dec_degree:02d}:{dec_minute:02d}:{dec_second:04.1f}"
 
 
 @dataclass(frozen=True)
@@ -187,6 +282,13 @@ class CameraProjection:
     center_x: float
     center_y: float
     residual_p90_px: float
+
+
+@dataclass(frozen=True)
+class SeizaLocalSolveResult:
+    camera_projection: CameraProjection | None
+    catalog_match_count: int
+    verified_tiles: tuple[SolverTile, ...]
 
 
 @dataclass(frozen=True)
@@ -1270,14 +1372,14 @@ def _try_seiza_local_camera_fit(
     progress: Progress | None,
     *,
     seiza_data: tuple[object, object],
-) -> tuple[CameraProjection, int] | None:
-    """Blind-solve one low-distortion patch, then verify a full-frame camera model.
+) -> SeizaLocalSolveResult | None:
+    """Blind-solve and retain independently W08-verified wide-field patches.
 
     Wide lenses can prevent whole-frame asterism solvers from finding a stable
     pattern. This fallback blind-solves overlapping local patches with Seiza,
-    cross-checks each solution against the packaged W08/Gaia catalogue, fits
-    the camera pose from that local astrometry, and accepts it only if the pose
-    predicts a spatially distributed set of sources across the full frame.
+    cross-checks each solution against the packaged W08/Gaia catalogue, and
+    retains each local WCS that has enough accurate, spatially distributed
+    matches. A full-frame camera projection is an optional separate result.
     """
     try:
         import seiza
@@ -1382,17 +1484,55 @@ def _try_seiza_local_camera_fit(
         if not candidates:
             return None
         candidates.sort(key=lambda item: (-item[0], item[1], item[3]))
-        # A fixed budget bounds latency on large sensors; ordering by local
-        # source support still reserves edge tiles when they contain stars.
-        candidates = candidates[:24]
+        # Spread a bounded set of attempts across the frame. Solving only the
+        # highest-density crop tends to leave wide-field corners without a
+        # local WCS even when the central crop yields a valid camera pose.
+        spread_candidates: list[tuple[float, float, tuple[int, int, int, int], float]] = []
+        remaining = list(candidates)
+        image_diagonal = max(math.hypot(detector_width, detector_height), 1.0)
+        while remaining and len(spread_candidates) < 24:
+            if not spread_candidates:
+                selected = remaining[0]
+            else:
+                selected = max(
+                    remaining,
+                    key=lambda item: item[0] * (
+                        0.35 + 0.65 * min(
+                            math.hypot(
+                                (item[2][0] + item[2][2]) * 0.5 - (prior[2][0] + prior[2][2]) * 0.5,
+                                (item[2][1] + item[2][3]) * 0.5 - (prior[2][1] + prior[2][3]) * 0.5,
+                            ) / image_diagonal
+                            for prior in spread_candidates
+                        )
+                    ),
+                )
+            spread_candidates.append(selected)
+            remaining.remove(selected)
+        candidates = spread_candidates
         if progress:
             progress(54, f"全幅盲解未收敛，正在用 Seiza 分区识别广角星点（{len(candidates)} 个候选区域）…")
 
         tree = cKDTree(catalog_vectors)
         attempts = 0
         last_error: Exception | None = None
+        verified_tiles: list[SolverTile] = []
+        best_projection: CameraProjection | None = None
+        best_projection_match_count = 0
+        sky_cells: set[tuple[int, int]] = set()
+        for grid_y in range(3):
+            for grid_x in range(4):
+                x0 = int(round(detector_width * grid_x / 4))
+                x1 = int(round(detector_width * (grid_x + 1) / 4))
+                y0 = int(round(detector_height * grid_y / 3))
+                y1 = int(round(detector_height * (grid_y + 1) / 3))
+                if sky_mask is None or sky_mask.shape != detector.shape:
+                    sky_cells.add((grid_x, grid_y))
+                elif float(np.mean(~np.asarray(sky_mask[y0:y1, x0:x1], dtype=bool))) >= 0.12:
+                    sky_cells.add((grid_x, grid_y))
         for _score, _center_distance, (x0, y0, x1, y1), _target_fov in candidates:
             attempts += 1
+            if attempts > 24 or len(verified_tiles) >= 8:
+                break
             crop = np.asarray(detector[y0:y1, x0:x1], dtype=np.float32).copy()
             crop_mask: np.ndarray | None = None
             if sky_mask is not None and sky_mask.shape == detector.shape:
@@ -1512,6 +1652,35 @@ def _try_seiza_local_camera_fit(
                     if len(accepted) < 20:
                         continue
 
+                    local_residuals = np.asarray(
+                        [match.separation_arcsec for match in accepted.values()],
+                        dtype=np.float64,
+                    )
+                    local_match_p50 = float(np.percentile(local_residuals, 50.0))
+                    local_match_p90 = float(np.percentile(local_residuals, 90.0))
+                    matched_detector_xy = np.asarray([
+                        [float(getattr(stars[source_id], "x")), float(getattr(stars[source_id], "y"))]
+                        for source_id in accepted
+                    ], dtype=np.float64)
+                    spread_x = float(np.ptp(matched_detector_xy[:, 0])) / max(x1 - x0, 1)
+                    spread_y = float(np.ptp(matched_detector_xy[:, 1])) / max(y1 - y0, 1)
+                    local_grid_x = np.clip(
+                        ((matched_detector_xy[:, 0] - x0) / max(x1 - x0, 1) * 3).astype(np.intp),
+                        0, 2,
+                    )
+                    local_grid_y = np.clip(
+                        ((matched_detector_xy[:, 1] - y0) / max(y1 - y0, 1) * 3).astype(np.intp),
+                        0, 2,
+                    )
+                    occupied_local_cells = len(set(zip(local_grid_x.tolist(), local_grid_y.tolist())))
+                    local_tile_is_verified = (
+                        local_match_p50 <= max(20.0, solution.scale_arcsec_px * 0.6)
+                        and local_match_p90 <= max(45.0, solution.scale_arcsec_px * 1.5)
+                        and spread_x >= 0.10
+                        and spread_y >= 0.10
+                        and occupied_local_cells >= 3
+                    )
+
                     tile_wcs = _seiza_wcs_on_solver_grid(
                         solution.wcs, detector_scale_xy, (y1 - y0, x1 - x0)
                     )
@@ -1532,6 +1701,21 @@ def _try_seiza_local_camera_fit(
                         len(accepted),
                         False,
                     )
+                    tile_area = max((tile.x1 - tile.x0) * (tile.y1 - tile.y0), 1)
+                    overlaps_existing = False
+                    for previous in verified_tiles:
+                        ix = max(0, min(tile.x1, previous.x1) - max(tile.x0, previous.x0))
+                        iy = max(0, min(tile.y1, previous.y1) - max(tile.y0, previous.y0))
+                        intersection = ix * iy
+                        previous_area = max(
+                            (previous.x1 - previous.x0) * (previous.y1 - previous.y0), 1
+                        )
+                        if intersection / min(tile_area, previous_area) >= 0.78:
+                            overlaps_existing = True
+                            break
+                    if local_tile_is_verified and not overlaps_existing:
+                        verified_tiles.append(tile)
+
                     projection = _fit_wide_camera_projection(
                         stars,
                         accepted,
@@ -1540,56 +1724,102 @@ def _try_seiza_local_camera_fit(
                         detector_scale_xy,
                         info,
                     )
-                    if projection is None:
-                        continue
-                    pairs = _camera_catalog_pairs(
-                        catalog_magnitudes,
-                        catalog_vectors,
-                        projection,
-                        source_pixels_array,
-                        source_ids_array,
-                        source_tree,
-                        detector.shape,
-                        detector_scale_xy,
-                        sky_mask,
-                        8.0,
-                        info,
-                    )
-                    close_pairs = [pair for pair in pairs if pair[0] <= 4.0]
-                    inliers = [pair for pair in pairs if pair[0] <= 6.0]
-                    if len(close_pairs) < 24 or len(inliers) < 40:
-                        continue
-                    residuals = np.asarray([pair[0] for pair in inliers], dtype=np.float64)
-                    if float(np.percentile(residuals, 90.0)) > 6.0:
-                        continue
-                    matched_xy = source_pixels_array[
-                        np.asarray([pair[2] for pair in close_pairs], dtype=np.intp)
-                    ]
-                    if float(np.ptp(matched_xy[:, 0])) < solver_width * 0.35:
-                        continue
-                    if float(np.ptp(matched_xy[:, 1])) < solver_height * 0.20:
-                        continue
-                    grid_x = np.clip((matched_xy[:, 0] / solver_width * 4).astype(np.intp), 0, 3)
-                    grid_y = np.clip((matched_xy[:, 1] / solver_height * 4).astype(np.intp), 0, 3)
-                    if len(set(zip(grid_x.tolist(), grid_y.tolist()))) < 6:
-                        continue
-                    projection = replace(
-                        projection,
-                        residual_p90_px=float(np.percentile(residuals, 90.0)),
-                    )
-                    if progress:
-                        progress(
-                            55,
-                            f"Seiza 局部盲解通过全幅 W08/Gaia 复核：{len(close_pairs)} 颗星，"
-                            f"全幅 P90 {projection.residual_p90_px:.2f} solver px。",
+                    if projection is not None:
+                        pairs = _camera_catalog_pairs(
+                            catalog_magnitudes,
+                            catalog_vectors,
+                            projection,
+                            source_pixels_array,
+                            source_ids_array,
+                            source_tree,
+                            detector.shape,
+                            detector_scale_xy,
+                            sky_mask,
+                            8.0,
+                            info,
                         )
-                    return projection, len(close_pairs)
+                        close_pairs = [pair for pair in pairs if pair[0] <= 4.0]
+                        inliers = [pair for pair in pairs if pair[0] <= 6.0]
+                        if len(close_pairs) >= 24 and len(inliers) >= 40:
+                            residuals = np.asarray([pair[0] for pair in inliers], dtype=np.float64)
+                            matched_xy = source_pixels_array[
+                                np.asarray([pair[2] for pair in close_pairs], dtype=np.intp)
+                            ]
+                            grid_x = np.clip((matched_xy[:, 0] / solver_width * 4).astype(np.intp), 0, 3)
+                            grid_y = np.clip((matched_xy[:, 1] / solver_height * 4).astype(np.intp), 0, 3)
+                            spatially_distributed = (
+                                float(np.percentile(residuals, 90.0)) <= 6.0
+                                and float(np.ptp(matched_xy[:, 0])) >= solver_width * 0.35
+                                and float(np.ptp(matched_xy[:, 1])) >= solver_height * 0.20
+                                and len(set(zip(grid_x.tolist(), grid_y.tolist()))) >= 6
+                            )
+                            if spatially_distributed:
+                                projection = replace(
+                                    projection,
+                                    residual_p90_px=float(np.percentile(residuals, 90.0)),
+                                )
+                                if (
+                                    best_projection is None
+                                    or len(close_pairs) > best_projection_match_count
+                                ):
+                                    best_projection = projection
+                                    best_projection_match_count = len(close_pairs)
+                                if progress:
+                                    progress(
+                                        55,
+                                        f"Seiza 局部解提出的全幅模型通过分布式 W08/Gaia 校验："
+                                        f"{len(close_pairs)} 个匹配，P90 {projection.residual_p90_px:.2f} solver px；"
+                                        f"已保留 {len(verified_tiles)} 个局部复核图块。",
+                                    )
+
+                    # Each crop has already passed a one-to-one W08 match,
+                    # residual, and spatial-spread check. Keep it even when a
+                    # rectilinear full-frame extrapolation is not trustworthy.
+                    break
                 except Exception as error:
                     last_error = error
                     continue
 
+            if verified_tiles and sky_cells:
+                covered_cells: set[tuple[int, int]] = set()
+                for tile in verified_tiles:
+                    left = tile.x0 / max(scale_x, 1e-8)
+                    top = tile.y0 / max(scale_y, 1e-8)
+                    right = tile.x1 / max(scale_x, 1e-8)
+                    bottom = tile.y1 / max(scale_y, 1e-8)
+                    for grid_x, grid_y in sky_cells:
+                        cell_left = detector_width * grid_x / 4
+                        cell_right = detector_width * (grid_x + 1) / 4
+                        cell_top = detector_height * grid_y / 3
+                        cell_bottom = detector_height * (grid_y + 1) / 3
+                        overlap_x = max(0.0, min(right, cell_right) - max(left, cell_left))
+                        overlap_y = max(0.0, min(bottom, cell_bottom) - max(top, cell_top))
+                        if overlap_x * overlap_y >= (cell_right - cell_left) * (cell_bottom - cell_top) * 0.55:
+                            covered_cells.add((grid_x, grid_y))
+                if len(covered_cells) >= math.ceil(len(sky_cells) * 0.85):
+                    break
+
+        if verified_tiles or best_projection is not None:
+            if progress:
+                if best_projection is not None:
+                    progress(
+                        55,
+                        f"Seiza 已取得 {len(verified_tiles)} 个局部 W08 复核图块；"
+                        f"全幅姿态通过 {best_projection_match_count} 个分布式匹配。",
+                    )
+                else:
+                    progress(
+                        55,
+                        f"Seiza 仅确认了 {len(verified_tiles)} 个局部 WCS 图块；"
+                        "其余区域仍标为未解算，不作全幅推算。",
+                    )
+            return SeizaLocalSolveResult(
+                best_projection,
+                best_projection_match_count,
+                tuple(verified_tiles),
+            )
         if progress and last_error is not None:
-            progress(55, f"Seiza 局部星表解未通过全幅姿态复核：{type(last_error).__name__}")
+            progress(55, f"Seiza 局部星表解未通过 W08 局部复核：{type(last_error).__name__}")
         return None
     except Exception as error:
         if progress:
@@ -1977,6 +2207,8 @@ def _positions_to_sky(
     full_fov_width = _axis_fov_degrees(0, solver_width, solver_width, sensor_width_mm, focal_mm)
     if not 0.15 <= min(full_fov_height, full_fov_width) <= 180:
         raise RuntimeError("相机镜头视场估算超出本地板解算支持范围。")
+    preliminary_camera_result: SeizaLocalSolveResult | None = None
+    preliminary_local_tiles: list[SolverTile] = []
 
     # If the Seiza data is already cached, try its fast blind solve before
     # ASTAP's multi-tile sweep. A verified full-frame solution avoids spending
@@ -2066,22 +2298,21 @@ def _positions_to_sky(
             seiza_data=local_seiza_data,
         )
         if local_camera_result is not None:
-            camera_projection, catalog_match_count = local_camera_result
-            positions, pixel_scale = _positions_from_camera_projection(
-                stars,
-                detector,
-                sky_mask,
-                detector_scale_xy,
-                (sensor_width_mm, sensor_height_mm),
-                camera_projection,
-            )
-            if progress:
+            preliminary_camera_result = local_camera_result
+            preliminary_local_tiles.extend(local_camera_result.verified_tiles)
+            if progress and local_camera_result.camera_projection is not None:
+                camera_projection = local_camera_result.camera_projection
                 progress(
                     55,
-                    f"广角局部解算已完成整幅星表确认：{catalog_match_count} 颗 Gaia/W08 匹配，"
-                    f"P90 {camera_projection.residual_p90_px:.2f} solver px。",
+                    f"广角相机候选模型通过分布式 Gaia/W08 校验：{local_camera_result.catalog_match_count} 个匹配，"
+                    f"P90 {camera_projection.residual_p90_px:.2f} px；继续检查重叠图块和边缘区域。",
                 )
-            return positions, pixel_scale, full_fov_height, [], camera_projection
+            elif progress:
+                progress(
+                    55,
+                    f"Seiza 只取得 {len(local_camera_result.verified_tiles)} 个局部 WCS；"
+                    "继续搜索其他图块，尚未确认的区域不会按全幅识别处理。",
+                )
 
     valid_height = solver_height
     if sky_mask is not None and sky_mask.shape == detector.shape:
@@ -2268,8 +2499,35 @@ def _positions_to_sky(
     boxes = coarse_boxes + compact_boxes
 
     successful: list[SolverTile] = []
+    for tile in preliminary_local_tiles:
+        if not any(
+            (item.x0, item.y0, item.x1, item.y1) == (tile.x0, tile.y0, tile.x1, tile.y1)
+            for item in successful
+        ):
+            successful.append(tile)
+    strong_camera_model = bool(
+        preliminary_camera_result is not None
+        and preliminary_camera_result.camera_projection is not None
+        and preliminary_camera_result.catalog_match_count >= 120
+        and preliminary_camera_result.camera_projection.residual_p90_px <= 6.0
+    )
+    if strong_camera_model and not successful:
+        # Seiza has already sampled distributed local patches and the global
+        # pose passed hundreds of independent W08 checks. Repeating a large
+        # ASTAP crop sweep on this case produced no trusted tile on 6627.NEF;
+        # use the measured model residual for catalogue-guided image searches.
+        boxes = []
+        if progress:
+            projection = preliminary_camera_result.camera_projection
+            assert projection is not None
+            progress(
+                53,
+                f"全幅坐标模型已通过 {preliminary_camera_result.catalog_match_count} 个分布式 W08 匹配，"
+                f"P90 {projection.residual_p90_px:.2f} px；按实测误差回搜图像星点，"
+                "未确认的星表位置仍不柔焦。",
+            )
     wide_candidates: list[SolverTile] = []
-    wide_camera_result: tuple[CameraProjection, int] | None = None
+    wide_camera_result: SeizaLocalSolveResult | None = None
     catalog_confirmed_boxes: set[tuple[int, int, int, int]] = set()
     diagnostics: list[str] = [seiza_local_message] if seiza_local_message else []
     solve_deadline = time.monotonic() + 150.0
@@ -2670,6 +2928,14 @@ def _positions_to_sky(
                             progress,
                             seiza_data=downloaded_seiza_data,
                         )
+                        if wide_camera_result is not None:
+                            for tile in wide_camera_result.verified_tiles:
+                                if not any(
+                                    (item.x0, item.y0, item.x1, item.y1)
+                                    == (tile.x0, tile.y0, tile.x1, tile.y1)
+                                    for item in successful
+                                ):
+                                    successful.append(tile)
             elif maximum_fov > 90.0 and seiza_local_message:
                 diagnostics.append(
                     f"整幅视场约 {maximum_fov:.0f}°；本机 Seiza 候选未通过 W08 复核，"
@@ -2680,7 +2946,12 @@ def _positions_to_sky(
             # stars than the compact G<=15 catalog supplies. Escalate only
             # after ASTAP and the light Seiza catalog both fail, keeping the
             # larger G<=17 database out of ordinary first-run installs.
-            if not successful and wide_camera_result is None and maximum_fov <= 120.0:
+            if (
+                not successful
+                and wide_camera_result is None
+                and maximum_fov <= 120.0
+                and not strong_camera_model
+            ):
                 deep_seiza_data = _load_seiza_solver_data(
                     progress,
                     allow_download=True,
@@ -2723,6 +2994,14 @@ def _positions_to_sky(
                             progress,
                             seiza_data=deep_seiza_data,
                         )
+                        if wide_camera_result is not None:
+                            for tile in wide_camera_result.verified_tiles:
+                                if not any(
+                                    (item.x0, item.y0, item.x1, item.y1)
+                                    == (tile.x0, tile.y0, tile.x1, tile.y1)
+                                    for item in successful
+                                ):
+                                    successful.append(tile)
 
         if progress:
             tile_summary = "; ".join(
@@ -2736,8 +3015,17 @@ def _positions_to_sky(
             )
         solver_source._mmap.close()
 
-    if wide_camera_result is not None:
-        camera_projection, catalog_match_count = wide_camera_result
+    final_camera_result = next(
+        (
+            result for result in (wide_camera_result, preliminary_camera_result)
+            if result is not None and result.camera_projection is not None
+        ),
+        None,
+    )
+    if final_camera_result is not None:
+        camera_projection = final_camera_result.camera_projection
+        assert camera_projection is not None
+        catalog_match_count = final_camera_result.catalog_match_count
         positions, pixel_scale = _positions_from_camera_projection(
             stars,
             detector,
@@ -2746,13 +3034,19 @@ def _positions_to_sky(
             (sensor_width_mm, sensor_height_mm),
             camera_projection,
         )
+        if successful:
+            local_positions = _positions_from_solved_tiles(stars, successful, detector_scale_xy)
+            positions_by_source = {index: (index, ra, dec) for index, ra, dec in positions}
+            positions_by_source.update({index: (index, ra, dec) for index, ra, dec in local_positions})
+            positions = list(positions_by_source.values())
         if progress:
             progress(
                 55,
-                f"下载星表后广角局部解算完成整幅确认：{catalog_match_count} 颗 Gaia/W08 匹配，"
-                f"P90 {camera_projection.residual_p90_px:.2f} solver px。",
+                f"广角相机模型通过分布式 Gaia/W08 校验：{catalog_match_count} 个匹配，"
+                f"拟合 P90 {camera_projection.residual_p90_px:.2f} solver px；"
+                f"局部 WCS 覆盖 {len(successful)} 个图块，图像点源另行统计。",
             )
-        return positions, pixel_scale, full_fov_height, [], camera_projection
+        return positions, pixel_scale, full_fov_height, successful, camera_projection
 
     if not successful:
         diagnostic_suffix = ""
@@ -2907,7 +3201,10 @@ def match_local_bright_stars(
     relative_magnitude_limit: float = 5.0,
     sensitivity: float = 4.8,
     progress: Progress | None = None,
-) -> tuple[dict[int, CatalogMatch], int, list[RecoveredCatalogStar]]:
+) -> tuple[
+    dict[int, CatalogMatch], int, list[RecoveredCatalogStar],
+    tuple[CatalogPosition, ...], tuple[CatalogCoverageArea, ...],
+]:
     """Solve locally and match against ASTAP's bundled Gaia-derived W08 bright-star index."""
     (
         positions,
@@ -2925,6 +3222,25 @@ def match_local_bright_stars(
         Path(primary_image_path) if primary_image_path else None,
         progress,
     )
+    detector_height, detector_width = detector.shape
+    detector_scale_x, detector_scale_y = detector_scale_xy
+    local_coverage_areas = tuple(
+        CatalogCoverageArea(
+            float(np.clip(tile.x0 / max(detector_scale_x, 1e-8), 0.0, detector_width)),
+            float(np.clip(tile.y0 / max(detector_scale_y, 1e-8), 0.0, detector_height)),
+            float(np.clip(tile.x1 / max(detector_scale_x, 1e-8), 0.0, detector_width)),
+            float(np.clip(tile.y1 / max(detector_scale_y, 1e-8), 0.0, detector_height)),
+            "local WCS tile",
+        )
+        for tile in successful_tiles
+    )
+    if known_camera_projection is not None:
+        coverage_areas = (
+            CatalogCoverageArea(0.0, 0.0, float(detector_width), float(detector_height), "camera projection"),
+            *local_coverage_areas,
+        )
+    else:
+        coverage_areas = local_coverage_areas
     if progress:
         progress(54, "正在本机读取 Gaia 亮星星表并匹配坐标…")
     _executable, catalogs = _executable_and_catalogs()
@@ -2933,7 +3249,7 @@ def match_local_bright_stars(
         raise RuntimeError("程序包缺少 ASTAP W08 本地亮星索引；请重新下载完整版本并解压。")
     catalog_magnitudes, catalog_vectors = _load_w08_catalog(str(catalog_path.resolve()))
     if not len(catalog_magnitudes):
-        return {}, len(positions), []
+        return {}, len(positions), [], (), coverage_areas
 
     # W08 is an all-sky bright-star subset, complete to approximately G=8.
     # Its catalogue positions and rounded G magnitudes are bundled with the app;
@@ -2944,6 +3260,18 @@ def match_local_bright_stars(
     # narrow fields retain a tighter tolerance to avoid ambiguous neighbours.
     radius_scale = 5.0 if full_fov_height > 20.0 else 2.0
     query_radius_arcsec = float(np.clip(pixel_scale_arcsec * radius_scale, 10.0, 240.0))
+    if known_camera_projection is not None:
+        # The rectilinear camera pose is validated by distributed catalogue
+        # matches, but wide-lens residuals still grow toward the frame edges.
+        # Use its measured P90 as a position prior for associating SEP sources
+        # and recovering missed detections; cap the radius to limit ambiguous
+        # neighbours in crowded fields. Image evidence is still mandatory.
+        residual_guided_radius = (
+            float(known_camera_projection.residual_p90_px) + 2.0
+        ) * max(float(pixel_scale_arcsec), 1e-8)
+        query_radius_arcsec = float(np.clip(
+            max(query_radius_arcsec, residual_guided_radius), 10.0, 600.0
+        ))
     tree = cKDTree(catalog_vectors)
     chord_limit = 2.0 * math.sin(math.radians(query_radius_arcsec / 3600.0) * 0.5)
     nearest_pairs: list[tuple[float, int, int]] = []
@@ -2966,7 +3294,8 @@ def match_local_bright_stars(
         ra = math.degrees(math.atan2(catalog_vectors[row_index, 1], catalog_vectors[row_index, 0])) % 360.0
         dec = math.degrees(math.asin(float(np.clip(catalog_vectors[row_index, 2], -1.0, 1.0))))
         matches[det_id] = CatalogMatch(
-            None, ra, dec, float(catalog_magnitudes[row_index]), None, None, separation
+            None, ra, dec, float(catalog_magnitudes[row_index]), None, None, separation,
+            row_index, _named_star_label(ra, dec),
         )
         used_detections.add(det_id)
         used_catalog_sources.add(row_index)
@@ -3111,7 +3440,8 @@ def match_local_bright_stars(
             if float(distance) <= recovery_radius_px and det_id not in used_detections:
                 matches[det_id] = CatalogMatch(
                     None, ra, dec, float(catalog_magnitudes[row_index]), None, None,
-                    float(distance) * detector_pixel_scale,
+                    float(distance) * detector_pixel_scale, row_index,
+                    _named_star_label(ra, dec),
                 )
                 used_detections.add(det_id)
                 used_catalog_sources.add(row_index)
@@ -3147,10 +3477,62 @@ def match_local_bright_stars(
             theta,
             snr,
             separation_px * detector_pixel_scale,
+            int(row_index),
+            ra,
+            dec,
+            _named_star_label(ra, dec),
         ))
         recovered_xy = np.vstack((recovered_xy, [x, y]))
         used_catalog_sources.add(row_index)
-    return matches, len(positions), recovered
+    catalog_positions: dict[int, CatalogPosition] = {}
+    for detector_id, match in matches.items():
+        row_index = match.catalog_row_index
+        if row_index is None or not (0 <= detector_id < len(stars)):
+            continue
+        source = stars[detector_id]
+        catalog_positions[row_index] = CatalogPosition(
+            float(getattr(source, "x")),
+            float(getattr(source, "y")),
+            match.g_mag,
+            "detected",
+            match.ra_deg,
+            match.dec_deg,
+            match.name or _named_star_label(match.ra_deg, match.dec_deg),
+            "image detection",
+        )
+    for source in recovered:
+        catalog_positions[source.catalog_row_index] = CatalogPosition(
+            source.x,
+            source.y,
+            source.g_mag,
+            "recovered",
+            source.ra_deg,
+            source.dec_deg,
+            source.name,
+            "catalog-guided image recovery",
+        )
+    for row_index, (_edge_margin, expected_x, expected_y) in projected.items():
+        if row_index in catalog_positions or not (0.0 <= expected_x < detector.shape[1] and 0.0 <= expected_y < detector.shape[0]):
+            continue
+        ra = math.degrees(math.atan2(catalog_vectors[row_index, 1], catalog_vectors[row_index, 0])) % 360.0
+        dec = math.degrees(math.asin(float(np.clip(catalog_vectors[row_index, 2], -1.0, 1.0))))
+        catalog_positions[row_index] = CatalogPosition(
+            float(expected_x),
+            float(expected_y),
+            float(catalog_magnitudes[row_index]),
+            "predicted",
+            ra,
+            dec,
+            _named_star_label(ra, dec),
+            "camera projection" if camera_projection is not None else "local WCS tile",
+        )
+    return (
+        matches,
+        len(positions),
+        recovered,
+        tuple(sorted(catalog_positions.values(), key=lambda item: (item.g_mag, item.y, item.x))),
+        coverage_areas,
+    )
 
 
 def _sky_unit_vectors(positions: Sequence[tuple[int, float, float]]) -> np.ndarray:

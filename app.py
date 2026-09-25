@@ -421,6 +421,11 @@ def _run_job(
             outputName=Path(result.output_path).name,
             preview=preview,
             comparisonPreview=result.comparison_preview,
+            coveragePreview=result.coverage_preview,
+            catalogPredictions=result.catalog_prediction_count,
+            catalogImageConfirmed=result.catalog_verified_count,
+            catalogUnconfirmed=result.catalog_unverified_count,
+            comparisonStars=result.comparison_star_count,
             analysis=result.analysis or prepared_analysis,
             analysisAvailable=bool(result.analysis or prepared_analysis),
             catalogCacheAvailable=bool(
@@ -515,7 +520,7 @@ def _make_handler(token: str):
                         return
                     summary = {
                         key: value for key, value in job.items()
-                        if key not in {"preview", "comparisonPreview", "analysis", "outputPath", "tempDir", "sourcePath"}
+                        if key not in {"preview", "comparisonPreview", "coveragePreview", "analysis", "outputPath", "tempDir", "sourcePath"}
                     }
                 self._json(200, summary)
                 return
@@ -536,9 +541,16 @@ def _make_handler(token: str):
                     if action == "comparison":
                         comparison = job.get("comparisonPreview")
                         if not comparison:
-                            self._json(404, {"error": "最亮星局部对比尚未准备好"})
+                            self._json(404, {"error": "星点局部对比尚未准备好"})
                             return
                         self._send(200, comparison, "image/jpeg")
+                        return
+                    if action == "coverage":
+                        coverage = job.get("coveragePreview")
+                        if not coverage:
+                            self._json(404, {"error": "星点识别覆盖图尚未准备好"})
+                            return
+                        self._send(200, coverage, "image/svg+xml; charset=utf-8")
                         return
                     if action == "download":
                         output_path = Path(job["outputPath"])

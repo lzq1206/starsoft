@@ -41,11 +41,14 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "下载或整理本机板解算组件失败。" }
     $uiFile = Join-Path $project "ui\index.html"
     $dataArgument = "$uiFile;ui"
+    $starNamesFile = Join-Path $project "data\hyg_named_stars.csv"
+    if (-not (Test-Path -LiteralPath $starNamesFile)) { throw "缺少本地恒星名称索引：$starNamesFile" }
+    $starNamesArgument = "$starNamesFile;data"
     $exePath = Join-Path $distDir "星点柔焦.exe"
 
     Push-Location $project
     try {
-        & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --distpath $distDir --workpath $workDir --specpath $buildRoot --collect-all rawpy --collect-all sep --collect-all tifffile --collect-all astropy --collect-all seiza --add-data $dataArgument app.py
+        & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --distpath $distDir --workpath $workDir --specpath $buildRoot --collect-all rawpy --collect-all sep --collect-all tifffile --collect-all astropy --collect-all seiza --add-data $dataArgument --add-data $starNamesArgument app.py
         if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败。" }
     } finally {
         Pop-Location
@@ -60,6 +63,8 @@ try {
     if (Test-Path $thirdPartyLicense) { Copy-Item -LiteralPath $thirdPartyLicense -Destination $packageDir }
     $thirdPartyNotice = Join-Path $project "licenses\THIRD_PARTY_NOTICES.txt"
     if (Test-Path $thirdPartyNotice) { Copy-Item -LiteralPath $thirdPartyNotice -Destination $packageDir }
+    $hygLicense = Join-Path $project "licenses\CC-BY-SA-4.0.txt"
+    if (Test-Path $hygLicense) { Copy-Item -LiteralPath $hygLicense -Destination $packageDir }
     Set-Content -LiteralPath (Join-Path $packageDir "VERSION.txt") -Value $version -Encoding utf8
     $exeHash = (Get-FileHash -LiteralPath (Join-Path $packageDir "星点柔焦.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath (Join-Path $packageDir "SHA256SUMS.txt") -Value "$exeHash  星点柔焦.exe" -Encoding utf8

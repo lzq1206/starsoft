@@ -5,3 +5,9 @@ Copyright the Seiza contributors
 Licensed under the Apache License, Version 2.0.
 Source: https://github.com/theatrus/seiza
 The complete license text is included in Seiza-Apache-2.0.txt.
+
+HYG named-star cross-reference
+The data/hyg_named_stars.csv file is a filtered and reformatted subset of HYG Database v4.1 by David Nash and contributors.
+Source: https://github.com/astronexus/HYG-Database/tree/main/hyg/CURRENT
+HYG v4.1 is licensed under Creative Commons Attribution-ShareAlike 4.0 International; the applicable license is included in CC-BY-SA-4.0.txt.
+The source's RA values are converted from hours to degrees. W08 Gaia-derived G magnitudes remain the brightness values shown by StarSoftFocus.
