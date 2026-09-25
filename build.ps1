@@ -45,7 +45,7 @@ try {
 
     Push-Location $project
     try {
-        & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --distpath $distDir --workpath $workDir --specpath $buildRoot --collect-all rawpy --collect-all sep --collect-all tifffile --collect-all astropy --add-data $dataArgument app.py
+        & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --distpath $distDir --workpath $workDir --specpath $buildRoot --collect-all rawpy --collect-all sep --collect-all tifffile --collect-all astropy --collect-all seiza --add-data $dataArgument app.py
         if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败。" }
     } finally {
         Pop-Location
@@ -56,6 +56,10 @@ try {
     Copy-Item -LiteralPath (Join-Path $project "README.md") -Destination $packageDir
     $licenseFile = Join-Path $project "LICENSE"
     if (Test-Path $licenseFile) { Copy-Item -LiteralPath $licenseFile -Destination $packageDir }
+    $thirdPartyLicense = Join-Path $project "licenses\Seiza-Apache-2.0.txt"
+    if (Test-Path $thirdPartyLicense) { Copy-Item -LiteralPath $thirdPartyLicense -Destination $packageDir }
+    $thirdPartyNotice = Join-Path $project "licenses\THIRD_PARTY_NOTICES.txt"
+    if (Test-Path $thirdPartyNotice) { Copy-Item -LiteralPath $thirdPartyNotice -Destination $packageDir }
     Set-Content -LiteralPath (Join-Path $packageDir "VERSION.txt") -Value $version -Encoding utf8
     $exeHash = (Get-FileHash -LiteralPath (Join-Path $packageDir "星点柔焦.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath (Join-Path $packageDir "SHA256SUMS.txt") -Value "$exeHash  星点柔焦.exe" -Encoding utf8

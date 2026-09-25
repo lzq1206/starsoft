@@ -71,7 +71,7 @@ def _report_startup_error(details: str) -> None:
 try:
     from PIL import Image
 
-    from processor import RawInfo, process_raw
+    from processor import PreparedAnalysis, RawInfo, process_raw
     from version import APP_VERSION
 except Exception:
     _report_startup_error(traceback.format_exc())
@@ -186,6 +186,44 @@ def _safe_filename(name: str) -> str:
     return name[:180] or "night_sky.raw"
 
 
+def _processing_params(query: dict[str, list[str]]) -> dict[str, float | str | None]:
+    try:
+        focal_value = str(query.get("focal_length_override_mm", [""])[0]).strip()
+        params: dict[str, float | str | None] = {
+            "sensitivity": float(query.get("sensitivity", ["4.8"])[0]),
+            "strength": float(query.get("strength", ["10"])[0]),
+            "opacity": float(query.get("opacity", ["30"])[0]),
+            "brightness_source": str(query.get("brightness_source", ["catalog"])[0]),
+            "relative_magnitude_limit": float(query.get("relative_magnitude_limit", ["5.0"])[0]),
+            "min_radius": float(query.get("min_radius", ["3"])[0]),
+            "max_radius": float(query.get("max_radius", ["42"])[0]),
+            "focal_length_override_mm": float(focal_value) if focal_value else None,
+            "sensor_format": str(query.get("sensor_format", ["auto"])[0]).strip().lower() or "auto",
+        }
+    except (ValueError, TypeError):
+        raise ValueError("柔焦参数无效。") from None
+    params["sensitivity"] = min(max(float(params["sensitivity"]), 2.0), 10.0)
+    params["strength"] = min(max(float(params["strength"]), 0.0), 30.0)
+    params["opacity"] = min(max(float(params["opacity"]), 0.0), 100.0)
+    if params["brightness_source"] not in {"catalog", "image"}:
+        raise ValueError("星点亮度来源无效。")
+    params["relative_magnitude_limit"] = min(max(float(params["relative_magnitude_limit"]), 0.0), 10.0)
+    params["min_radius"] = min(max(float(params["min_radius"]), 2.0), 24.0)
+    params["max_radius"] = min(max(float(params["max_radius"]), 8.0), 80.0)
+    if float(params["max_radius"]) < float(params["min_radius"]):
+        params["min_radius"], params["max_radius"] = params["max_radius"], params["min_radius"]
+    params["sensor_format"] = str(params["sensor_format"])
+    if params["sensor_format"] not in {"auto", "full_frame", "aps_c", "medium_4433", "four_thirds", "one_inch"}:
+        raise ValueError("相机画幅选项无效。")
+    focal = params["focal_length_override_mm"]
+    if focal is not None:
+        focal = float(focal)
+        if not 1.0 <= focal <= 1000.0:
+            raise ValueError("手动焦距须在 1–1000 mm 范围内。")
+        params["focal_length_override_mm"] = focal
+    return params
+
+
 def _update_job(job_id: str, **values: object) -> None:
     with JOBS_LOCK:
         job = JOBS.get(job_id)
@@ -233,6 +271,17 @@ def _prune_jobs(now: float | None = None) -> None:
         retained = sorted((item for item in completed if item[1] not in remove_ids))
         for _finished_at, job_id in retained[:-MAX_RETAINED_COMPLETED_JOBS]:
             remove_ids.add(job_id)
+
+        # A rerender can hold an analysis cache created under the source job's
+        # temp directory. Keep that directory until every derived job expires.
+        for job_id in tuple(remove_ids):
+            if any(
+                other_id not in remove_ids
+                and str(other.get("analysisOwnerId", other_id)) == job_id
+                for other_id, other in JOBS.items()
+                if other_id != job_id
+            ):
+                remove_ids.discard(job_id)
 
         temp_dirs: list[str] = []
         for job_id in remove_ids:
@@ -306,7 +355,15 @@ def _watch_lifecycle(server: ThreadingHTTPServer, started_at: float) -> None:
                 return
 
 
-def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str, float | str]) -> None:
+def _run_job(
+    job_id: str,
+    input_path: Path,
+    output_path: Path,
+    params: dict[str, float | str | None],
+    *,
+    analysis_cache_path: Path | None = None,
+    prepared_analysis: PreparedAnalysis | None = None,
+) -> None:
     def report(percent: int, message: str) -> None:
         _update_job(job_id, percent=10 + int(percent * 0.9), message=message)
 
@@ -319,12 +376,21 @@ def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str,
                     "lens": info.lens,
                     "focalLength": info.focal_length,
                     "aperture": info.aperture,
+                    "sensorFormat": info.sensor_format or "auto",
                     "width": info.width,
                     "height": info.height,
                 },
             )
 
-        result = process_raw(input_path, output_path, **params, progress=report, metadata_callback=metadata)
+        result = process_raw(
+            input_path,
+            output_path,
+            **params,
+            analysis_cache_path=analysis_cache_path,
+            prepared_analysis=prepared_analysis,
+            progress=report,
+            metadata_callback=metadata,
+        )
         _update_job(job_id, message="正在准备预览…", percent=98)
         with Image.open(output_path) as image:
             image.thumbnail((1600, 1100), Image.Resampling.LANCZOS)
@@ -354,6 +420,14 @@ def _run_job(job_id: str, input_path: Path, output_path: Path, params: dict[str,
             skyAdaptationGain=result.sky_adaptation_gain,
             outputName=Path(result.output_path).name,
             preview=preview,
+            comparisonPreview=result.comparison_preview,
+            analysis=result.analysis or prepared_analysis,
+            analysisAvailable=bool(result.analysis or prepared_analysis),
+            catalogCacheAvailable=bool(
+                (result.analysis or prepared_analysis)
+                and (result.analysis or prepared_analysis).catalog_entries
+            ),
+            params=params,
         )
     except Exception as exc:
         _update_job(job_id, state="error", message=str(exc), percent=0)
@@ -439,7 +513,10 @@ def _make_handler(token: str):
                     if not job:
                         self._json(404, {"error": "任务不存在"})
                         return
-                    summary = {key: value for key, value in job.items() if key not in {"preview", "outputPath", "tempDir"}}
+                    summary = {
+                        key: value for key, value in job.items()
+                        if key not in {"preview", "comparisonPreview", "analysis", "outputPath", "tempDir", "sourcePath"}
+                    }
                 self._json(200, summary)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "jobs"]:
@@ -455,6 +532,13 @@ def _make_handler(token: str):
                             self._json(404, {"error": "预览尚未准备好"})
                             return
                         self._send(200, preview, "image/jpeg")
+                        return
+                    if action == "comparison":
+                        comparison = job.get("comparisonPreview")
+                        if not comparison:
+                            self._json(404, {"error": "最亮星局部对比尚未准备好"})
+                            return
+                        self._send(200, comparison, "image/jpeg")
                         return
                     if action == "download":
                         output_path = Path(job["outputPath"])
@@ -545,6 +629,86 @@ def _make_handler(token: str):
                 if no_clients:
                     threading.Thread(target=_shutdown_after_page_close, args=(self.server,), daemon=True).start()
                 return
+            route_parts = route.strip("/").split("/")
+            if len(route_parts) == 4 and route_parts[:2] == ["api", "jobs"] and route_parts[3] == "reprocess":
+                source_job_id = route_parts[2]
+                query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+                try:
+                    params = _processing_params(query)
+                except ValueError as exc:
+                    self._json(400, {"error": str(exc)})
+                    return
+                with JOBS_LOCK:
+                    previous = JOBS.get(source_job_id)
+                    prepared = previous.get("analysis") if previous else None
+                    previous_params = dict(previous.get("params") or {}) if previous else {}
+                    source_name = str(previous.get("sourceName", "night_sky.raw")) if previous else "night_sky.raw"
+                    source_path = Path(previous.get("sourcePath", "cached-input")) if previous else Path("cached-input")
+                    owner_id = str(previous.get("analysisOwnerId", source_job_id)) if previous else source_job_id
+                    state = previous.get("state") if previous else None
+                if state != "complete" or not isinstance(prepared, PreparedAnalysis):
+                    self._json(409, {"error": "没有可复用的识别缓存；请重新上传照片进行识别。"})
+                    return
+                if any(params.get(key) != previous_params.get(key) for key in (
+                    "sensitivity", "focal_length_override_mm", "sensor_format"
+                )):
+                    self._json(409, {"error": "星点识别灵敏度或相机视场参数已变化，需要重新识别照片。"})
+                    return
+                if (
+                    params.get("brightness_source") == "catalog"
+                    and previous_params.get("brightness_source") != "catalog"
+                    and not prepared.catalog_entries
+                ):
+                    self._json(409, {"error": "当前缓存没有星表匹配结果；切换到真实星表亮度需要重新识别。"})
+                    return
+
+                _prune_jobs()
+                temp_dir: str | None = None
+                try:
+                    temp_dir = tempfile.mkdtemp(prefix="starsoft_")
+                    _register_temp_dir(temp_dir)
+                    job_id = secrets.token_urlsafe(18)
+                    output_path = Path(temp_dir) / f"{Path(source_name).stem}_星点柔焦.tif"
+                    with JOBS_LOCK:
+                        JOBS[job_id] = {
+                            "id": job_id,
+                            "state": "processing",
+                            "percent": 0,
+                            "message": "正在复用已识别星点，只重新生成柔焦…",
+                            "sourceName": source_name,
+                            "sourcePath": str(source_path),
+                            "outputName": output_path.name,
+                            "outputPath": str(output_path),
+                            "tempDir": temp_dir,
+                            "createdAt": time.time(),
+                            "analysis": prepared,
+                            "analysisOwnerId": owner_id,
+                            "analysisAvailable": True,
+                            "catalogCacheAvailable": bool(prepared.catalog_entries),
+                            "params": params,
+                        }
+                    worker = threading.Thread(
+                        target=_run_job,
+                        args=(job_id, source_path, output_path, params),
+                        kwargs={"prepared_analysis": prepared},
+                        daemon=True,
+                    )
+                    try:
+                        worker.start()
+                    except RuntimeError as exc:
+                        _update_job(job_id, state="error", message=f"无法启动柔焦重处理：{exc}", percent=0)
+                        _release_job_directory(job_id)
+                        self._json(500, {"error": "无法启动柔焦重处理任务"})
+                        return
+                except Exception:
+                    if temp_dir is not None:
+                        with JOBS_LOCK:
+                            registered_job = any(job.get("tempDir") == temp_dir for job in JOBS.values())
+                        if not registered_job:
+                            _remove_temp_dir(temp_dir)
+                    raise
+                self._json(202, {"id": job_id, "reusedAnalysis": True})
+                return
             if route != "/api/jobs":
                 self._json(404, {"error": "not found"})
                 return
@@ -566,30 +730,12 @@ def _make_handler(token: str):
             if Path(name).suffix.lower() not in supported_extensions:
                 self._json(415, {"error": "请选择相机 RAW、TIFF 或 JPG 文件。"})
                 return
-            query = parse_qs(urlsplit(self.path).query)
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
             try:
-                params = {
-                    "sensitivity": float(query.get("sensitivity", ["4.8"])[0]),
-                    "strength": float(query.get("strength", ["10"])[0]),
-                    "opacity": float(query.get("opacity", ["30"])[0]),
-                    "brightness_source": str(query.get("brightness_source", ["catalog"])[0]),
-                    "relative_magnitude_limit": float(query.get("relative_magnitude_limit", ["5.0"])[0]),
-                    "min_radius": float(query.get("min_radius", ["3"])[0]),
-                    "max_radius": float(query.get("max_radius", ["42"])[0]),
-                }
-            except ValueError:
-                self._json(400, {"error": "柔焦参数无效"})
+                params = _processing_params(query)
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
                 return
-            params["sensitivity"] = min(max(params["sensitivity"], 2.0), 10.0)
-            params["strength"] = min(max(params["strength"], 0.0), 30.0)
-            params["opacity"] = min(max(params["opacity"], 0.0), 100.0)
-            if params["brightness_source"] not in {"catalog", "image"}:
-                raise ValueError("星点亮度来源无效")
-            params["relative_magnitude_limit"] = min(max(params["relative_magnitude_limit"], 0.0), 10.0)
-            params["min_radius"] = min(max(params["min_radius"], 2.0), 24.0)
-            params["max_radius"] = min(max(params["max_radius"], 8.0), 80.0)
-            if params["max_radius"] < params["min_radius"]:
-                params["min_radius"], params["max_radius"] = params["max_radius"], params["min_radius"]
 
             _prune_jobs()
             _begin_transfer()
@@ -622,12 +768,20 @@ def _make_handler(token: str):
                         "percent": 0,
                         "message": "文件已接收，正在启动识别…",
                         "sourceName": name,
+                        "sourcePath": str(input_path),
                         "outputName": output_path.name,
                         "outputPath": str(output_path),
                         "tempDir": temp_dir,
                         "createdAt": time.time(),
+                        "analysisOwnerId": job_id,
+                        "params": params,
                     }
-                worker = threading.Thread(target=_run_job, args=(job_id, input_path, output_path, params), daemon=True)
+                worker = threading.Thread(
+                    target=_run_job,
+                    args=(job_id, input_path, output_path, params),
+                    kwargs={"analysis_cache_path": Path(temp_dir) / "analysis_f32.bin"},
+                    daemon=True,
+                )
                 try:
                     worker.start()
                 except RuntimeError as exc:

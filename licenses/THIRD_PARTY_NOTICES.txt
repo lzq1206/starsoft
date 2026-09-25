@@ -1,0 +1,7 @@
+StarSoftFocus bundles the Seiza Python bindings and local solver engine.
+
+Seiza
+Copyright the Seiza contributors
+Licensed under the Apache License, Version 2.0.
+Source: https://github.com/theatrus/seiza
+The complete license text is included in Seiza-Apache-2.0.txt.

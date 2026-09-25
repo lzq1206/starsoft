@@ -40,6 +40,7 @@ class RawInfo:
     aperture: float | None
     preview: Image.Image | None
     focal_length_35mm: float | None = None
+    sensor_format: str | None = None
 
 
 MetadataCallback = Callable[[RawInfo], None]
@@ -96,6 +97,8 @@ class ProcessResult:
     color_profile: str
     sky_background_level: float
     sky_adaptation_gain: float
+    comparison_preview: bytes | None = None
+    analysis: PreparedAnalysis | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +112,40 @@ class RasterInput:
     input_kind: str
     linear_srgb: bool
     invert_gray: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedAnalysis:
+    """Recognition products and decoded scene data retained for parameter-only rerenders."""
+
+    image_cache_path: str
+    image_shape: tuple[int, ...]
+    alpha_cache_path: str | None
+    detector_shape: tuple[int, int]
+    detector_stars: tuple[Star, ...]
+    catalog_entries: tuple[tuple[Star, float, bool], ...]
+    candidate_count: int
+    catalog_position_count: int
+    catalog_match_count: int
+    info: RawInfo
+    profile: bytes | None
+    profile_description: str
+    is_rgb: bool
+    invert_gray: bool
+    photometric: object
+    input_kind: str
+    encoding: str
+    linear_srgb: bool
+    sky_mask_info: dict[str, object]
+    sky_background_level: float
+    raw_preview_median: float | None
+    raw_linear_median: float | None
+    raw_preview_ev: float
+    raw_xmp_exposure_ev: float | None
+    raw_exposure_shift: float
+    raw_acr_reference_median: float | None
+    raw_acr_reference_name: str | None
+    raw_brightness_calibration_method: str
 
 
 def _clean_text(value: object) -> str:
@@ -155,6 +192,23 @@ def read_raw_info(path: str | Path) -> RawInfo:
     with rawpy.imread(str(path)) as raw:
         preview = _extract_raw_preview(raw)
         return _raw_info(raw, preview)
+
+
+def _apply_camera_overrides(
+    info: RawInfo,
+    focal_length_override_mm: float | None,
+    sensor_format: str,
+) -> RawInfo:
+    sensor_format = str(sensor_format or "auto").strip().lower()
+    if sensor_format not in {"auto", "full_frame", "aps_c", "medium_4433", "four_thirds", "one_inch"}:
+        raise ValueError("相机画幅选项无效。")
+    if focal_length_override_mm is not None:
+        focal = float(focal_length_override_mm)
+        if not math.isfinite(focal) or not 1.0 <= focal <= 1000.0:
+            raise ValueError("手动焦距须在 1–1000 mm 范围内。")
+        lens = f"{info.lens} · 手动焦距 {focal:g} mm" if info.lens else f"手动焦距 {focal:g} mm"
+        info = replace(info, focal_length=focal, focal_length_35mm=None, lens=lens)
+    return replace(info, sensor_format=None if sensor_format == "auto" else sensor_format)
 
 
 def _extract_raw_preview(raw: rawpy.RawPy) -> Image.Image | None:
@@ -353,7 +407,7 @@ def _sky_detection_mask(
     horizon_found = (
         best_row < height
         and sky_before > 0.015
-        and best_drop >= max(0.015, sky_before * 0.28)
+        and best_drop >= max(0.015, sky_before * 0.22)
     )
     if horizon_found:
         boundary = max(1, best_row - max(2, int(round(height * 0.006))))
@@ -424,12 +478,12 @@ def _nearby_compact_source_counts(
     return counts
 
 
-def _detector_image(raw: rawpy.RawPy) -> tuple[np.ndarray, int]:
+def _detector_image(raw: rawpy.RawPy, focal_length_override_mm: float | None = None) -> tuple[np.ndarray, int]:
     """Build a binned, linear luminance proxy from the visible sensor area."""
     sensor = raw.raw_image_visible
     height, width = sensor.shape[:2]
 
-    focal = float(raw.other.focal_length or 0)
+    focal = float(focal_length_override_mm or raw.other.focal_length or 0)
     if not focal:
         focal = 70.0
     # Longer focal lengths give a larger stellar profile on the same sensor.
@@ -782,8 +836,10 @@ def detect_stars(
     detector: np.ndarray,
     sensitivity: float,
     detection_mask: np.ndarray | None = None,
+    *,
+    allow_widefield_elongation: bool = False,
 ) -> tuple[list[Star], int, int, float]:
-    """Return every SEP point-source candidate for later Gaia catalogue matching."""
+    """Return SEP point-source candidates for image photometry or Gaia matching."""
     data = np.ascontiguousarray(detector, dtype=np.float32)
     mask = np.ascontiguousarray(detection_mask, dtype=bool) if detection_mask is not None else None
     if mask is not None and mask.shape != data.shape:
@@ -877,6 +933,8 @@ def detect_stars(
     )
     crowded_stellar_field = nearby_compact >= 4
     elevated_local_noise = local_noise > 4.0 * global_rms
+    roundness_floor = 0.20 if allow_widefield_elongation else 0.35
+    major_axis_limit = 18.0 if allow_widefield_elongation else min(12.0, max(6.0, 5.0 * psf_sigma))
     point_source = (
         np.isfinite(objects["x"])
         & np.isfinite(objects["y"])
@@ -884,8 +942,8 @@ def detect_stars(
         & np.isfinite(moment_size)
         & (objects["flux"] > 0)
         & (minor >= 0.35)
-        & (major <= min(12.0, max(6.0, 5.0 * psf_sigma)))
-        & (roundness >= 0.35)
+        & (major <= major_axis_limit)
+        & (roundness >= roundness_floor)
         & (~elevated_local_noise | crowded_stellar_field)
         & ~bad_flags
     )
@@ -1240,6 +1298,117 @@ def _linear_to_srgb_inplace(linear: np.ndarray) -> None:
     np.multiply(linear, 12.92, out=linear, where=high)
 
 
+def _select_stars(
+    detector_stars: list[Star],
+    catalog_entries: list[tuple[Star, float, bool]],
+    brightness_source: str,
+    relative_magnitude_limit: float,
+) -> tuple[list[Star], int, float | None, int]:
+    if brightness_source == "catalog":
+        if not catalog_entries:
+            raise ValueError(
+                "真实星表亮度模式没有可复用的星表匹配结果。请重新识别照片，或切换到图像解析星点亮度。"
+            )
+        reference_g_mag = min(g_mag for _star, g_mag, _recovered in catalog_entries)
+        catalog_stars: list[Star] = []
+        recovered_count = 0
+        for star, g_mag, was_recovered in catalog_entries:
+            delta_g = max(0.0, float(g_mag - reference_g_mag))
+            if delta_g > relative_magnitude_limit:
+                continue
+            relative_catalog_flux = 10.0 ** (-0.4 * delta_g)
+            catalog_stars.append(replace(
+                star,
+                flux=relative_catalog_flux,
+                relative_flux_ratio=relative_catalog_flux,
+                image_flux=star.image_flux if star.image_flux is not None else star.flux,
+                catalog_g_mag=g_mag,
+                catalog_delta_magnitude=delta_g,
+                catalog_position_recovered=was_recovered,
+            ))
+            recovered_count += int(was_recovered)
+        stars = sorted(catalog_stars, key=lambda star: star.catalog_g_mag if star.catalog_g_mag is not None else math.inf)
+        if not stars:
+            raise ValueError("本地星表匹配成功，但所选相对星等范围内没有星点；请增大亮度范围控制值。")
+        return stars, len(stars), reference_g_mag, recovered_count
+
+    brightest_image_flux = max((star.flux for star in detector_stars), default=0.0)
+    if brightest_image_flux <= 0.0:
+        raise ValueError("图像解析模式没有可用的星点测光结果。")
+    image_stars: list[Star] = []
+    for star in detector_stars:
+        relative_flux = float(star.flux) / brightest_image_flux
+        delta_m = -2.5 * math.log10(max(relative_flux, 1e-20))
+        if delta_m <= relative_magnitude_limit + 1e-9:
+            image_stars.append(replace(
+                star,
+                relative_flux_ratio=relative_flux,
+                image_flux=star.flux,
+            ))
+    if not image_stars:
+        raise ValueError("当前图像亮度范围内没有检出的星点，请增大 Δm 或降低星点识别灵敏度。")
+    return image_stars, len(image_stars), None, 0
+
+
+def _brightest_star_crop(
+    image_data: np.ndarray,
+    stars: list[Star],
+    detector_shape: tuple[int, int],
+    brightness_source: str,
+    max_radius: float,
+) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+    if not stars:
+        return None
+    brightest = min(
+        stars,
+        key=(lambda star: star.catalog_g_mag if star.catalog_g_mag is not None else math.inf)
+        if brightness_source == "catalog"
+        else (lambda star: -star.flux),
+    )
+    height, width = image_data.shape[:2]
+    scale_x, scale_y = width / detector_shape[1], height / detector_shape[0]
+    center_x = int(round((brightest.x + 0.5) * scale_x - 0.5))
+    center_y = int(round((brightest.y + 0.5) * scale_y - 0.5))
+    half = int(np.clip(math.ceil(max(64.0, max_radius * 2.5)), 64, 256))
+    x0, x1 = max(0, center_x - half), min(width, center_x + half + 1)
+    y0, y1 = max(0, center_y - half), min(height, center_y + half + 1)
+    return (x0, y0, x1, y1), np.array(image_data[y0:y1, x0:x1], dtype=np.float32, copy=True)
+
+
+def _comparison_jpeg(
+    before: np.ndarray | None,
+    after: np.ndarray | None,
+    profile: bytes | None,
+) -> bytes | None:
+    if before is None or after is None:
+        return None
+
+    def to_rgb8(pixels: np.ndarray) -> np.ndarray:
+        pixels = np.asarray(pixels, dtype=np.float32)
+        if pixels.ndim == 2:
+            pixels = pixels[..., None]
+        if pixels.shape[2] == 1:
+            pixels = np.repeat(pixels, 3, axis=2)
+        pixels = np.clip(pixels[..., :3], 0.0, 1.0)
+        return np.rint(pixels * 255.0).astype(np.uint8)
+
+    left, right = to_rgb8(before), to_rgb8(after)
+    height = min(left.shape[0], right.shape[0])
+    width = min(left.shape[1], right.shape[1])
+    if height < 8 or width < 8:
+        return None
+    left, right = left[:height, :width], right[:height, :width]
+    panel = np.zeros((height, width * 2 + 5, 3), dtype=np.uint8)
+    panel[:, :width] = left
+    panel[:, width + 5:] = right
+    buffer = BytesIO()
+    options: dict[str, object] = {"format": "JPEG", "quality": 92, "optimize": True}
+    if profile:
+        options["icc_profile"] = profile
+    Image.fromarray(panel, mode="RGB").save(buffer, **options)
+    return buffer.getvalue()
+
+
 def process_raw(
     input_path: str | Path,
     output_path: str | Path,
@@ -1251,6 +1420,10 @@ def process_raw(
     relative_magnitude_limit: float = 5.0,
     min_radius: float = 3.0,
     max_radius: float = 42.0,
+    focal_length_override_mm: float | None = None,
+    sensor_format: str = "auto",
+    analysis_cache_path: str | Path | None = None,
+    prepared_analysis: PreparedAnalysis | None = None,
     progress: Progress | None = None,
     metadata_callback: MetadataCallback | None = None,
 ) -> ProcessResult:
@@ -1265,6 +1438,13 @@ def process_raw(
     brightness_source = str(brightness_source).strip().lower()
     if brightness_source not in {"catalog", "image"}:
         raise ValueError("星点亮度来源无效，请选择真实星表亮度或图像解析星点亮度。")
+    if focal_length_override_mm is not None:
+        focal_length_override_mm = float(focal_length_override_mm)
+        if not math.isfinite(focal_length_override_mm) or not 1.0 <= focal_length_override_mm <= 1000.0:
+            raise ValueError("手动焦距须在 1–1000 mm 范围内。")
+    sensor_format = str(sensor_format or "auto").strip().lower()
+    if sensor_format not in {"auto", "full_frame", "aps_c", "medium_4433", "four_thirds", "one_inch"}:
+        raise ValueError("相机画幅选项无效。")
     relative_magnitude_limit = float(np.clip(relative_magnitude_limit, 0.0, 10.0))
     strength = float(np.clip(strength, 0.0, 30.0))
     opacity = float(np.clip(opacity, 0.0, 100.0))
@@ -1283,131 +1463,183 @@ def process_raw(
     raw_acr_reference_name: str | None = None
     raw_brightness_calibration_method = "no calibration reference available"
     sky_mask_info: dict[str, object] = {}
-    if input_path.suffix.lower() in {".tif", ".tiff", ".jpg", ".jpeg"}:
-        raster = _read_raster(input_path)
-        info = raster.info
-        if metadata_callback:
-            metadata_callback(info)
-        detector, _factor = _raster_detector_image(raster.pixels, info.focal_length)
-        sky_mask, sky_mask_info = _sky_detection_mask(raster.pixels, detector.shape)
-        report(12, "正在识别星点与测量亮度…")
-        stars, candidate_count, selected_count, sky_background_level = detect_stars(
-            detector, sensitivity, sky_mask
-        )
-        image_data = raster.pixels
-        profile = raster.profile
-        profile_description = raster.profile_description
-        is_rgb = raster.is_rgb
-        alpha = raster.alpha
-        invert_gray = raster.invert_gray
-        photometric = tifffile.PHOTOMETRIC.RGB if is_rgb else (
-            tifffile.PHOTOMETRIC.MINISWHITE if invert_gray else tifffile.PHOTOMETRIC.MINISBLACK
-        )
-        input_kind = raster.input_kind
-        encoding = (
-            "linear-light sRGB processing; original ICC profile bytes preserved"
-            if raster.linear_srgb and profile
-            else "linear-light sRGB processing; input was untagged and remains untagged"
-            if raster.linear_srgb
-            else "native source channel encoding retained; original ICC profile bytes preserved"
-        )
-        report(36, f"天空区域找到 {candidate_count:,} 个点源候选，准备按亮度来源筛选…")
-    else:
-        raw_extensions = {
-            ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".sr2", ".srf", ".dng",
-            ".orf", ".rw2", ".raf", ".pef", ".ptx", ".3fr", ".fff", ".iiq", ".kdc",
-            ".dcr", ".mos", ".mrw", ".x3f",
-        }
-        if input_path.suffix.lower() not in raw_extensions:
-            raise ValueError("请选择相机 RAW、TIFF 或 JPG 文件。")
-        with rawpy.imread(str(input_path)) as raw:
-            raw_xmp_exposure_ev = _read_xmp_exposure_ev(input_path)
-            preview = _extract_raw_preview(raw)
-            info = _raw_info(raw, preview)
+    raster: RasterInput | None = None
+    linear_srgb = False
+    if prepared_analysis is None:
+        if input_path.suffix.lower() in {".tif", ".tiff", ".jpg", ".jpeg"}:
+            raster = _read_raster(input_path)
+            info = _apply_camera_overrides(raster.info, focal_length_override_mm, sensor_format)
+            raster = replace(raster, info=info)
             if metadata_callback:
                 metadata_callback(info)
-            detector, _factor = _detector_image(raw)
-            sky_mask, sky_mask_info = _sky_detection_mask(
-                preview if preview is not None else detector, detector.shape
-            )
+            detector, _factor = _raster_detector_image(raster.pixels, info.focal_length)
+            sky_mask, sky_mask_info = _sky_detection_mask(raster.pixels, detector.shape)
             report(12, "正在识别星点与测量亮度…")
             stars, candidate_count, selected_count, sky_background_level = detect_stars(
-                detector, sensitivity, sky_mask
+                detector, sensitivity, sky_mask,
+                allow_widefield_elongation=brightness_source == "catalog",
             )
-            raw_acr_reference_median, raw_acr_reference_name = _acr_reference_luminance_median(input_path)
-            if preview is not None:
-                raw_preview_median = _preview_linear_luminance_median(preview)
-            if preview is not None or raw_acr_reference_median is not None:
-                report(36, "正在校准 RAW 曝光与同名参考图…")
-                calibration_rgb = raw.postprocess(
+            image_data = raster.pixels
+            profile = raster.profile
+            profile_description = raster.profile_description
+            is_rgb = raster.is_rgb
+            alpha = raster.alpha
+            invert_gray = raster.invert_gray
+            photometric = tifffile.PHOTOMETRIC.RGB if is_rgb else (
+                tifffile.PHOTOMETRIC.MINISWHITE if invert_gray else tifffile.PHOTOMETRIC.MINISBLACK
+            )
+            input_kind = raster.input_kind
+            encoding = (
+                "linear-light sRGB processing; original ICC profile bytes preserved"
+                if raster.linear_srgb and profile
+                else "linear-light sRGB processing; input was untagged and remains untagged"
+                if raster.linear_srgb
+                else "native source channel encoding retained; original ICC profile bytes preserved"
+            )
+            report(36, f"天空区域找到 {candidate_count:,} 个点源候选，准备按亮度来源筛选…")
+        else:
+            raw_extensions = {
+                ".cr3", ".cr2", ".crw", ".nef", ".nrw", ".arw", ".sr2", ".srf", ".dng",
+                ".orf", ".rw2", ".raf", ".pef", ".ptx", ".3fr", ".fff", ".iiq", ".kdc",
+                ".dcr", ".mos", ".mrw", ".x3f",
+            }
+            if input_path.suffix.lower() not in raw_extensions:
+                raise ValueError("请选择相机 RAW、TIFF 或 JPG 文件。")
+            with rawpy.imread(str(input_path)) as raw:
+                raw_xmp_exposure_ev = _read_xmp_exposure_ev(input_path)
+                preview = _extract_raw_preview(raw)
+                info = _apply_camera_overrides(_raw_info(raw, preview), focal_length_override_mm, sensor_format)
+                if metadata_callback:
+                    metadata_callback(info)
+                detector, _factor = _detector_image(raw, focal_length_override_mm)
+                sky_mask, sky_mask_info = _sky_detection_mask(
+                    preview if preview is not None else detector, detector.shape
+                )
+                report(12, "正在识别星点与测量亮度…")
+                stars, candidate_count, selected_count, sky_background_level = detect_stars(
+                    detector, sensitivity, sky_mask,
+                    allow_widefield_elongation=brightness_source == "catalog",
+                )
+                raw_acr_reference_median, raw_acr_reference_name = _acr_reference_luminance_median(input_path)
+                if preview is not None:
+                    raw_preview_median = _preview_linear_luminance_median(preview)
+                if preview is not None or raw_acr_reference_median is not None:
+                    report(36, "正在校准 RAW 曝光与同名参考图…")
+                    calibration_rgb = raw.postprocess(
+                        gamma=(1, 1),
+                        no_auto_bright=True,
+                        exp_shift=1.0,
+                        exp_preserve_highlights=0.0,
+                        output_bps=16,
+                        output_color=rawpy.ColorSpace.sRGB,
+                        use_camera_wb=True,
+                        demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
+                        half_size=True,
+                    )
+                    calibration_float = calibration_rgb.astype(np.float32)
+                    np.divide(calibration_float, 65535.0, out=calibration_float)
+                    raw_linear_median = _linear_rgb_luminance_median(calibration_float)
+                    del calibration_rgb, calibration_float
+                if preview is not None and raw_linear_median is not None and raw_preview_median is not None:
+                    raw_preview_ev = _preview_exposure_ev(
+                        raw_linear_median, raw_preview_median
+                    )
+                raw_exposure_shift = _raw_exposure_shift(
+                    raw_preview_ev, raw_xmp_exposure_ev
+                )
+                if raw_acr_reference_median is not None and raw_linear_median is not None and raw_linear_median > 1e-8:
+                    # A same-stem Adobe Camera Raw TIFF has already rendered the
+                    # sidecar settings through Adobe's profile and tone pipeline.
+                    # Match its scene median directly instead of stacking XMP EV a
+                    # second time on top of the embedded camera JPEG.
+                    raw_exposure_shift = float(np.clip(
+                        raw_acr_reference_median / raw_linear_median, 0.25, 8.0
+                    ))
+                    raw_brightness_calibration_method = "same-stem Adobe Camera Raw TIFF median; XMP exposure already reflected in reference"
+                elif raw_preview_median is not None:
+                    raw_brightness_calibration_method = "embedded preview median combined with XMP Exposure2012 when present"
+                elif preview is not None and raw_xmp_exposure_ev is not None:
+                    raw_brightness_calibration_method = "non-sRGB embedded preview left in its original colour space; XMP Exposure2012 only"
+                elif raw_xmp_exposure_ev is not None:
+                    raw_brightness_calibration_method = "XMP Exposure2012 only; no embedded preview or Adobe TIFF reference"
+                report(43, f"天空区域找到 {candidate_count:,} 个点源候选，正在解码 RAW…")
+                rgb = raw.postprocess(
                     gamma=(1, 1),
                     no_auto_bright=True,
-                    exp_shift=1.0,
-                    exp_preserve_highlights=0.0,
+                    exp_shift=raw_exposure_shift,
+                    exp_preserve_highlights=1.0,
                     output_bps=16,
                     output_color=rawpy.ColorSpace.sRGB,
                     use_camera_wb=True,
                     demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
-                    half_size=True,
                 )
-                calibration_float = calibration_rgb.astype(np.float32)
-                np.divide(calibration_float, 65535.0, out=calibration_float)
-                raw_linear_median = _linear_rgb_luminance_median(calibration_float)
-                del calibration_rgb, calibration_float
-            if preview is not None and raw_linear_median is not None and raw_preview_median is not None:
-                raw_preview_ev = _preview_exposure_ev(
-                    raw_linear_median, raw_preview_median
-                )
-            raw_exposure_shift = _raw_exposure_shift(
-                raw_preview_ev, raw_xmp_exposure_ev
-            )
-            if raw_acr_reference_median is not None and raw_linear_median is not None and raw_linear_median > 1e-8:
-                # A same-stem Adobe Camera Raw TIFF has already rendered the
-                # sidecar settings through Adobe's profile and tone pipeline.
-                # Match its scene median directly instead of stacking XMP EV a
-                # second time on top of the embedded camera JPEG.
-                raw_exposure_shift = float(np.clip(
-                    raw_acr_reference_median / raw_linear_median, 0.25, 8.0
-                ))
-                raw_brightness_calibration_method = "same-stem Adobe Camera Raw TIFF median; XMP exposure already reflected in reference"
-            elif raw_preview_median is not None:
-                raw_brightness_calibration_method = "embedded preview median combined with XMP Exposure2012 when present"
-            elif preview is not None and raw_xmp_exposure_ev is not None:
-                raw_brightness_calibration_method = "non-sRGB embedded preview left in its original colour space; XMP Exposure2012 only"
-            elif raw_xmp_exposure_ev is not None:
-                raw_brightness_calibration_method = "XMP Exposure2012 only; no embedded preview or Adobe TIFF reference"
-            report(43, f"天空区域找到 {candidate_count:,} 个点源候选，正在解码 RAW…")
-            rgb = raw.postprocess(
-                gamma=(1, 1),
-                no_auto_bright=True,
-                exp_shift=raw_exposure_shift,
-                exp_preserve_highlights=1.0,
-                output_bps=16,
-                output_color=rawpy.ColorSpace.sRGB,
-                use_camera_wb=True,
-                demosaic_algorithm=rawpy.DemosaicAlgorithm.AHD,
-            )
 
-        if rgb.ndim != 3 or rgb.shape[2] < 3:
-            raise ValueError("RAW 解码后未得到 RGB 图像。")
-        image_data = np.empty(rgb.shape[:2] + (3,), dtype=np.float32)
-        np.divide(rgb[..., :3], 65535.0, out=image_data, casting="unsafe")
-        del rgb
-        profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
-        profile_description = "sRGB IEC61966-2.1"
-        is_rgb = True
+            if rgb.ndim != 3 or rgb.shape[2] < 3:
+                raise ValueError("RAW 解码后未得到 RGB 图像。")
+            image_data = np.empty(rgb.shape[:2] + (3,), dtype=np.float32)
+            np.divide(rgb[..., :3], 65535.0, out=image_data, casting="unsafe")
+            del rgb
+            profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+            profile_description = "sRGB IEC61966-2.1"
+            is_rgb = True
+            alpha = None
+            invert_gray = False
+            photometric = tifffile.PHOTOMETRIC.RGB
+            input_kind = "RAW"
+            encoding = "RAW developed to 16-bit sRGB with XMP/sRGB-preview or matching Adobe Camera Raw TIFF exposure calibration and highlight preservation; halo processing uses float32 linear-light values; sRGB ICC profile embedded"
+
+        detector_shape = detector.shape
+        linear_srgb = bool(raster.linear_srgb) if raster is not None else False
+    else:
+        report(4, "正在复用本机已识别的星点与 WCS…")
+        prepared = prepared_analysis
+        mapped = np.memmap(prepared.image_cache_path, mode="r", dtype=np.float32, shape=prepared.image_shape)
+        try:
+            image_data = np.array(mapped, dtype=np.float32, copy=True)
+        finally:
+            mapped._mmap.close()
         alpha = None
-        invert_gray = False
-        photometric = tifffile.PHOTOMETRIC.RGB
-        input_kind = "RAW"
-        encoding = "RAW developed to 16-bit sRGB with XMP/sRGB-preview or matching Adobe Camera Raw TIFF exposure calibration and highlight preservation; halo processing uses float32 linear-light values; sRGB ICC profile embedded"
-
-    detector_stars = stars
+        if prepared.alpha_cache_path:
+            alpha_shape = prepared.image_shape[:2]
+            alpha_map = np.memmap(prepared.alpha_cache_path, mode="r", dtype=np.float32, shape=alpha_shape)
+            try:
+                alpha = np.array(alpha_map, dtype=np.float32, copy=True)
+            finally:
+                alpha_map._mmap.close()
+        detector_shape = prepared.detector_shape
+        stars = list(prepared.detector_stars)
+        candidate_count = prepared.candidate_count
+        selected_count = len(stars)
+        sky_background_level = prepared.sky_background_level
+        sky_mask_info = dict(prepared.sky_mask_info)
+        info = prepared.info
+        profile = prepared.profile
+        profile_description = prepared.profile_description
+        is_rgb = prepared.is_rgb
+        invert_gray = prepared.invert_gray
+        photometric = prepared.photometric
+        input_kind = prepared.input_kind
+        encoding = prepared.encoding
+        linear_srgb = prepared.linear_srgb
+        raw_preview_median = prepared.raw_preview_median
+        raw_linear_median = prepared.raw_linear_median
+        raw_preview_ev = prepared.raw_preview_ev
+        raw_xmp_exposure_ev = prepared.raw_xmp_exposure_ev
+        raw_exposure_shift = prepared.raw_exposure_shift
+        raw_acr_reference_median = prepared.raw_acr_reference_median
+        raw_acr_reference_name = prepared.raw_acr_reference_name
+        raw_brightness_calibration_method = prepared.raw_brightness_calibration_method
+        if metadata_callback:
+            metadata_callback(info)
+    detector_stars = list(prepared_analysis.detector_stars) if prepared_analysis is not None else list(stars)
+    catalog_entries: list[tuple[Star, float, bool]] = []
     catalog_position_count = 0
     catalog_match_count = 0
-    recovered_catalog_star_count = 0
-    catalog_reference_g_mag: float | None = None
-    if brightness_source == "catalog":
+    if prepared_analysis is not None:
+        catalog_entries = list(prepared_analysis.catalog_entries)
+        catalog_position_count = prepared_analysis.catalog_position_count
+        catalog_match_count = prepared_analysis.catalog_match_count
+    elif brightness_source == "catalog":
         report(45, "图像解码完成，正在本机解算星空坐标…")
         solver_scale_xy = (
             image_data.shape[1] / detector.shape[1],
@@ -1439,12 +1671,14 @@ def process_raw(
                 solver_image_path,
                 solver_scale_xy,
                 primary_solver_path,
-                relative_magnitude_limit=relative_magnitude_limit,
+                # Cache all available W08 sources so changing Δm only reselects
+                # the existing matches instead of solving and matching again.
+                relative_magnitude_limit=10.0,
                 sensitivity=sensitivity,
                 progress=report,
             )
         catalog_match_count = len(catalog_matches) + len(recovered_sources)
-        catalog_entries: list[tuple[Star, float, bool]] = [
+        catalog_entries = [
             (detector_stars[index], match.g_mag, False)
             for index, match in catalog_matches.items()
             if 0 <= index < len(detector_stars)
@@ -1467,61 +1701,85 @@ def process_raw(
             source.g_mag,
             True,
         ) for source in recovered_sources)
-        if not catalog_entries:
-            raise ValueError(
-                "真实星表亮度模式未能匹配到可靠亮星或解算位置附近没有可确认的星点。"
-                "可切换到“图像解析星点亮度”继续处理。"
+
+    stars, selected_count, catalog_reference_g_mag, recovered_catalog_star_count = _select_stars(
+        detector_stars, catalog_entries, brightness_source, relative_magnitude_limit
+    )
+    report(
+        61,
+        f"{'本机星表匹配' if brightness_source == 'catalog' else 'SEP 检出'} "
+        f"{catalog_match_count if brightness_source == 'catalog' else candidate_count:,} 个候选，"
+        f"其中 {selected_count:,} 个符合亮度范围，正在柔焦…",
+    )
+    detector_shape = prepared_analysis.detector_shape if prepared_analysis is not None else detector.shape
+
+    analysis = prepared_analysis
+    if analysis is None and analysis_cache_path is not None:
+        cache_path = Path(analysis_cache_path)
+        alpha_cache_path: Path | None = None
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_map = np.memmap(cache_path, mode="w+", dtype=np.float32, shape=image_data.shape)
+            try:
+                for y0 in range(0, image_data.shape[0], 512):
+                    cache_map[y0:y0 + 512] = image_data[y0:y0 + 512]
+                cache_map.flush()
+            finally:
+                cache_map._mmap.close()
+            if alpha is not None:
+                alpha_cache_path = cache_path.with_name(cache_path.stem + "_alpha.f32")
+                alpha_map = np.memmap(alpha_cache_path, mode="w+", dtype=np.float32, shape=alpha.shape)
+                try:
+                    for y0 in range(0, alpha.shape[0], 512):
+                        alpha_map[y0:y0 + 512] = alpha[y0:y0 + 512]
+                    alpha_map.flush()
+                finally:
+                    alpha_map._mmap.close()
+            analysis = PreparedAnalysis(
+                image_cache_path=str(cache_path),
+                image_shape=tuple(image_data.shape),
+                alpha_cache_path=str(alpha_cache_path) if alpha_cache_path else None,
+                detector_shape=tuple(detector_shape),
+                detector_stars=tuple(detector_stars),
+                catalog_entries=tuple(catalog_entries),
+                candidate_count=int(candidate_count),
+                catalog_position_count=int(catalog_position_count),
+                catalog_match_count=int(catalog_match_count),
+                info=info,
+                profile=profile,
+                profile_description=profile_description,
+                is_rgb=is_rgb,
+                invert_gray=invert_gray,
+                photometric=photometric,
+                input_kind=input_kind,
+                encoding=encoding,
+                linear_srgb=linear_srgb,
+                sky_mask_info=dict(sky_mask_info),
+                sky_background_level=float(sky_background_level),
+                raw_preview_median=raw_preview_median,
+                raw_linear_median=raw_linear_median,
+                raw_preview_ev=float(raw_preview_ev),
+                raw_xmp_exposure_ev=raw_xmp_exposure_ev,
+                raw_exposure_shift=float(raw_exposure_shift),
+                raw_acr_reference_median=raw_acr_reference_median,
+                raw_acr_reference_name=raw_acr_reference_name,
+                raw_brightness_calibration_method=raw_brightness_calibration_method,
             )
-        catalog_reference_g_mag = min(g_mag for _star, g_mag, _recovered in catalog_entries)
-        catalog_stars: list[Star] = []
-        for star, g_mag, was_recovered in catalog_entries:
-            delta_g = max(0.0, float(g_mag - catalog_reference_g_mag))
-            if delta_g > relative_magnitude_limit:
-                continue
-            relative_catalog_flux = 10.0 ** (-0.4 * delta_g)
-            catalog_stars.append(replace(
-                star,
-                flux=relative_catalog_flux,
-                relative_flux_ratio=relative_catalog_flux,
-                image_flux=star.image_flux if star.image_flux is not None else star.flux,
-                catalog_g_mag=g_mag,
-                catalog_delta_magnitude=delta_g,
-                catalog_position_recovered=was_recovered,
-            ))
-            recovered_catalog_star_count += int(was_recovered)
-        stars = sorted(catalog_stars, key=lambda star: star.catalog_g_mag if star.catalog_g_mag is not None else math.inf)
-        selected_count = len(stars)
-        if selected_count == 0:
-            raise ValueError("本地星表匹配成功，但所选相对星等范围内没有星点；请增大亮度范围控制值。")
-        report(
-            61,
-            f"本机星表匹配 {catalog_match_count:,} 个点位（含位置补配 {len(recovered_sources):,} 个），"
-            f"其中 {selected_count:,} 个符合 ΔG 范围，正在柔焦…",
-        )
-    else:
-        report(45, "图像解码完成，正在按 1.4.7 图像相对亮度筛选星点…")
-        brightest_image_flux = max((star.flux for star in detector_stars), default=0.0)
-        if brightest_image_flux <= 0.0:
-            raise ValueError("图像解析模式没有可用的星点测光结果。")
-        image_stars: list[Star] = []
-        for star in detector_stars:
-            relative_flux = float(star.flux) / brightest_image_flux
-            delta_m = -2.5 * math.log10(max(relative_flux, 1e-20))
-            if delta_m <= relative_magnitude_limit + 1e-9:
-                image_stars.append(replace(
-                    star,
-                    relative_flux_ratio=relative_flux,
-                    image_flux=star.flux,
-                ))
-        stars = image_stars
-        selected_count = len(stars)
-        if selected_count == 0:
-            raise ValueError("当前图像亮度范围内没有检出的星点，请增大 Δm 或降低星点识别灵敏度。")
-        report(61, f"SEP 检出 {candidate_count:,} 个点源，其中 {selected_count:,} 个符合 Δm 范围，正在柔焦…")
+        except (OSError, ValueError, MemoryError):
+            analysis = None
+            cache_path.unlink(missing_ok=True)
+            if alpha_cache_path is not None:
+                alpha_cache_path.unlink(missing_ok=True)
+
+    brightest_crop = _brightest_star_crop(
+        image_data, stars, detector_shape, brightness_source, max_radius
+    )
+    crop_box = brightest_crop[0] if brightest_crop is not None else None
+    before_crop = brightest_crop[1] if brightest_crop is not None else None
     star_measurements = _soften_stars(
         image_data,
         stars,
-        detector.shape,
+        detector_shape,
         min_radius,
         max_radius,
         strength,
@@ -1532,10 +1790,19 @@ def process_raw(
         report,
     )
     report(92, "正在写入 16 位 TIFF…")
-    if input_kind == "RAW" or (input_path.suffix.lower() in {".tif", ".tiff", ".jpg", ".jpeg"} and raster.linear_srgb):
+    if input_kind == "RAW" or linear_srgb:
         _linear_to_srgb_inplace(image_data)
+        if before_crop is not None:
+            _linear_to_srgb_inplace(before_crop)
     if invert_gray:
         np.subtract(1.0, image_data, out=image_data)
+        if before_crop is not None:
+            np.subtract(1.0, before_crop, out=before_crop)
+    after_crop = None
+    if crop_box is not None:
+        x0, y0, x1, y1 = crop_box
+        after_crop = np.array(image_data[y0:y1, x0:x1], dtype=np.float32, copy=True)
+    comparison_preview = _comparison_jpeg(before_crop, after_crop, profile)
     # The working buffer remains float32 until this final 16-bit export step.
     # Clamp all formats here so additive halos cannot wrap uint16 highlights.
     np.clip(image_data, 0.0, 1.0, out=image_data)
@@ -1553,7 +1820,9 @@ def process_raw(
         "camera": info.camera,
         "lens": info.lens,
         "focal_length_mm": info.focal_length,
+        "focal_length_manual_override_mm": focal_length_override_mm,
         "focal_length_35mm_equivalent": info.focal_length_35mm,
+        "sensor_format": info.sensor_format or "auto",
         "aperture": info.aperture,
         "detected_stars": len(stars),
         "point_source_candidates": candidate_count,
@@ -1658,4 +1927,6 @@ def process_raw(
         color_profile=profile_description,
         sky_background_level=sky_background_level,
         sky_adaptation_gain=float(np.clip(sky_background_level / REFERENCE_SKY_LEVEL, 0.70, 1.50)),
+        comparison_preview=comparison_preview,
+        analysis=analysis,
     )

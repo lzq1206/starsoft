@@ -1,13 +1,13 @@
 # 星点柔焦
 
-星点柔焦的 Windows/macOS 本机引擎和 GitHub Pages 网页前端。支持相机 RAW、TIFF 和 JPG，可切换“根据真实星表亮度”或“图像解析星点亮度”两种筛选方式。星表模式使用随包 ASTAP 本机 WCS 解算器与 Gaia 派生亮星索引；图像模式沿用 1.4.7 的 SEP 相对孔径测光。程序按逐星 RGB 径向 PSF 生成正圆光晕，输出 16 位 TIFF。Windows/macOS ZIP 均含板解算器与亮星索引，无需另装解算器或联网匹配。Windows 构建脚本会在版本 ZIP 已存在时自动递增补丁号。
+星点柔焦的 Windows/macOS 本机引擎和 GitHub Pages 网页前端。支持相机 RAW、TIFF 和 JPG，可切换“根据真实星表亮度”或“图像解析星点亮度”两种筛选方式。星表模式使用随包 ASTAP 本机 WCS 解算器与 Gaia 派生亮星索引；ASTAP 无法确认时，会尝试 Seiza 本机盲解并用 W08 星表独立复核。首次需要 Seiza 数据时，程序自动下载并缓存 Gaia DR3 G≤15 星表和盲解索引；图像不会上传。困难视场经 ASTAP 和轻量目录仍未解出时，程序会升级到 G≤17 深度目录。图像模式沿用 1.4.7 的 SEP 相对孔径测光。程序按逐星 RGB 径向 PSF 生成正圆光晕，输出 16 位 TIFF。Windows 构建脚本会在版本 ZIP 已存在时自动递增补丁号。
 
 ## 使用
 
 1. Windows 解压对应版本 ZIP 后双击 `星点柔焦.exe`。macOS 解压对应架构 ZIP 后，在 Finder 中按住 Control 并点按“星点柔焦.app”，选择“打开”。macOS 启动失败时会显示错误并写入 `~/Library/Logs/StarSoftFocus/startup.log`。
-2. 程序先打开本机处理界面；点按标题栏的“网页版”可打开 GitHub Pages 前端。图像解码、星点检测与 ASTAP 板解算都在本机完成。
+2. 程序先打开本机处理界面；点按标题栏的“网页版”可打开 GitHub Pages 前端。图像解码、星点检测与板解算都在本机完成；只有首次备用盲解会下载公开星表数据并保存到系统缓存。
 3. 选择 RAW、TIFF 或 JPG 文件。RAW 会读取可用镜头数据，并依焦距决定星点检测分辨率。
-4. 选择亮度来源：“根据真实星表亮度”用本机 WCS 将星点与 W08 星表匹配，按 Gaia 派生 G 星等筛选；部分广角、严重畸变或星点较少的照片可能解算失败。“图像解析星点亮度”使用 1.4.7 的 SEP 相对圆孔径测光，不依赖板解算。亮度范围控制 Δm 默认 5.0 等，范围 0–10 等；数值越大，纳入的较暗点源越多，不限处理数量。星表模式使用的 W08 索引约完整至 G=8 等、精度为 0.1 等，不含 Gaia source_id 或 BP-RP。
+4. 选择亮度来源：“根据真实星表亮度”用本机 WCS 将星点与 W08 星表匹配，按 Gaia 派生 G 星等筛选；ASTAP 无法确认时会使用本机 Seiza 盲解，下载的数据只需获取一次。极广视场、严重畸变或星点较少的照片仍可能解算失败。“图像解析星点亮度”使用 1.4.7 的 SEP 相对圆孔径测光，不依赖板解算。亮度范围控制 Δm 默认 5.0 等，范围 0–10 等；数值越大，纳入的较暗点源越多，不限处理数量。随包 W08 索引约完整至 G=8 等、精度为 0.1 等，不含 Gaia source_id 或 BP-RP。
 5. 柔焦强度默认 10、范围 0–30。光晕不透明度独立控制，默认 30%，数值越高光晕越明显。
 6. 完成后下载 16 位 TIFF。
 
@@ -15,7 +15,7 @@
 
 检测使用 SEP 的局部背景与 RMS、PSF 匹配滤波和圆孔径测光。场景预览按逐行亮度跃变估计地平线，再用低通亮度抑制地景和树木剪影；检测背景和候选星点只统计天空遮罩内像素。点源形态允许圆度低至 0.35、长轴达到 max(6 px, 5 × PSF σ)（最高 12 px），避免把亮星、轻微拖线或像差星像误判为扩展目标；更大的弥散结构会被剔除。当地背景 RMS 高于天空全图 4 倍时，只有附近也检测到至少 4 个紧致点源的候选才保留；因此球状星团等拥挤星场中可分辨的成员星仍能柔化，弥散星云结构仍会被排除。此项是基于 SEP 形态与局部紧致源密度的简化拥挤场筛选，并非 DAOPHOT 的 PSF 拟合流程。[Stetson 1987, DAOPHOT](https://articles.adsabs.harvard.edu/pdf/1987PASP...99..191S)
 
-真实星表模式使用随包 ASTAP 命令行程序与 D05/G05/W08 索引。RAW/TIFF/JPG 的全分辨率 16 位灰度副本只用于解算；广角图像使用更多解算星点和多个重叠视场分别拟合畸变，优先采用离图块边缘较远的 WCS。星点经 SEP 检出后与 W08 交叉匹配；程序还会把局部 WCS 映射回 W08 星表位置，并在预期位置附近以较低门限重新检查紧致点源，因此可以补回部分 SEP 主检测漏掉的亮星。补配前仍需通过本地图像信噪比和点源形态检查。匹配全程离线，不会发送图像或天球坐标。W08 约完整至 G=8 等、精度 0.1 等，没有 Gaia source_id 或 BP-RP；光晕颜色按图像内逐星 RGB 取样。星表模式在相机焦距/画幅信息不足或板解算失败时会提示失败；可切换到图像亮度模式继续处理。相机 EXIF 不提供 35 mm 等效焦距时，只能依据程序内已识别的相机型号估算画幅。
+真实星表模式使用随包 ASTAP 命令行程序与 D05/G05/W08 索引。RAW/TIFF/JPG 的全分辨率 16 位灰度副本只用于解算；广角图像使用多个重叠视场分别拟合畸变，优先采用离图块边缘较远的 WCS。星点经 SEP 检出后与 W08 交叉匹配；程序还会把局部 WCS 映射回 W08 星表位置，并在预期位置附近以较低门限重新检查紧致点源，因此可以补回部分 SEP 主检测漏掉的亮星。ASTAP 无法确认时，Seiza 先以 Gaia DR3 G≤15 目录做本机盲解，再用低畸变局部视场解算并尝试外推整幅相机姿态；所有相机姿态都须通过 W08 一对一匹配、残差和空间覆盖复核。ASTAP 和轻量 Seiza 仍未解出时，会按需下载 Gaia DR3 G≤17 深度目录（约额外 1.54 GB）再次全幅或分区解算。首次 Seiza 备用数据约 2 GB；处理照片与星点坐标不会上传。W08 约完整至 G=8 等、精度 0.1 等，没有 Gaia source_id 或 BP-RP；光晕颜色按图像内逐星 RGB 取样。星表模式在相机焦距/画幅信息不足或板解算失败时会提示失败；可切换到图像亮度模式继续处理。相机 EXIF 不提供 35 mm 等效焦距时，只能依据程序内已识别的相机型号估算画幅。
 
 星表模式的控制值为本地 W08 G 星等相对于图内最亮匹配或位置补配星的差值 `ΔG=G−G最亮`。图像模式的控制值为 SEP 圆孔径通量得到的 `Δm=-2.5 log10(F/Fmax)`，完全沿用 1.4.7 的图像测光筛选和半径响应，不调用板解算或星表。
 
@@ -69,6 +69,7 @@ GitHub Pages 前端由 `.github/workflows/pages.yml` 自动构建和发布。网
 - [SciPy 高斯滤波与二维卷积实现](https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.gaussian_filter.html)、[二维高斯卷积核定义](https://docs.astropy.org/en/latest/api/astropy.convolution.Gaussian2DKernel.html)
 - [ASTAP 命令行板解算器与 W08 星表说明](https://www.hnsky.org/astap.htm)；程序包内附完整 ASTAP MPL-2.0 许可证、上游源码链接、Gaia/ESA/DPAC 归属与数据库 acknowledgement。
 - [ASTAP 四星四边形识别说明](https://www.hnsky.org/astap_astrometric_solving.htm)、[Astrometry.net 解算尺度约束与降采样文档](https://astrometrynet.readthedocs.io/en/latest/readme.html)
+- [Seiza 本机盲解算器](https://github.com/theatrus/seiza)：Gaia 盲解索引提供全幅候选 WCS，程序再用随包 W08 亮星数据作独立复核。
 - [rawpy / LibRaw](https://github.com/LibRaw/LibRaw)、[tifffile](https://github.com/cgohlke/tifffile)、[PyInstaller](https://github.com/pyinstaller/pyinstaller)
 
 ### 广角星空板解算
