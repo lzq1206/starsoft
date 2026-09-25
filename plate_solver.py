@@ -166,6 +166,7 @@ class CatalogMatch:
     separation_arcsec: float
     catalog_row_index: int | None = None
     name: str | None = None
+    position_recovered: bool = False
 
 
 @dataclass(frozen=True)
@@ -3311,7 +3312,10 @@ def match_local_bright_stars(
     detector_pixel_scale = pixel_scale_arcsec * max(
         math.sqrt(detector_scale_x * detector_scale_y), 1e-8
     )
-    recovery_radius_px = float(np.clip(query_radius_arcsec / max(detector_pixel_scale, 1e-8), 3.0, 10.0))
+    # Wide-angle lens distortion can leave bright edge stars several detector
+    # pixels from the pinhole/WCS prior. Search farther around validated
+    # projections, but still require an actual compact SEP source in the image.
+    recovery_radius_px = float(np.clip(query_radius_arcsec / max(detector_pixel_scale, 1e-8), 3.0, 18.0))
     detected_xy = np.asarray(
         [(float(getattr(star, "x")), float(getattr(star, "y"))) for star in stars],
         dtype=np.float64,
@@ -3441,7 +3445,7 @@ def match_local_bright_stars(
                 matches[det_id] = CatalogMatch(
                     None, ra, dec, float(catalog_magnitudes[row_index]), None, None,
                     float(distance) * detector_pixel_scale, row_index,
-                    _named_star_label(ra, dec),
+                    _named_star_label(ra, dec), True,
                 )
                 used_detections.add(det_id)
                 used_catalog_sources.add(row_index)
@@ -3494,11 +3498,11 @@ def match_local_bright_stars(
             float(getattr(source, "x")),
             float(getattr(source, "y")),
             match.g_mag,
-            "detected",
+            "recovered" if match.position_recovered else "detected",
             match.ra_deg,
             match.dec_deg,
             match.name or _named_star_label(match.ra_deg, match.dec_deg),
-            "image detection",
+            "WCS-guided image source" if match.position_recovered else "image detection",
         )
     for source in recovered:
         catalog_positions[source.catalog_row_index] = CatalogPosition(
@@ -3513,6 +3517,10 @@ def match_local_bright_stars(
         )
     for row_index, (_edge_margin, expected_x, expected_y) in projected.items():
         if row_index in catalog_positions or not (0.0 <= expected_x < detector.shape[1] and 0.0 <= expected_y < detector.shape[0]):
+            continue
+        center_x = int(np.clip(round(expected_x), 0, detector.shape[1] - 1))
+        center_y = int(np.clip(round(expected_y), 0, detector.shape[0] - 1))
+        if sky_mask is not None and sky_mask.shape == detector.shape and sky_mask[center_y, center_x]:
             continue
         ra = math.degrees(math.atan2(catalog_vectors[row_index, 1], catalog_vectors[row_index, 0])) % 360.0
         dec = math.degrees(math.asin(float(np.clip(catalog_vectors[row_index, 2], -1.0, 1.0))))

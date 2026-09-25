@@ -425,6 +425,7 @@ def _run_job(
             catalogPredictions=result.catalog_prediction_count,
             catalogImageConfirmed=result.catalog_verified_count,
             catalogUnconfirmed=result.catalog_unverified_count,
+            catalogGuidedRecovered=result.catalog_guided_recovered_count,
             comparisonStars=result.comparison_star_count,
             analysis=result.analysis or prepared_analysis,
             analysisAvailable=bool(result.analysis or prepared_analysis),

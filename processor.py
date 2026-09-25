@@ -80,6 +80,7 @@ class Star:
     catalog_name: str | None = None
     catalog_ra_deg: float | None = None
     catalog_dec_deg: float | None = None
+    catalog_position_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,7 @@ class ProcessResult:
     catalog_prediction_count: int = 0
     catalog_verified_count: int = 0
     catalog_unverified_count: int = 0
+    catalog_guided_recovered_count: int = 0
     analysis: PreparedAnalysis | None = None
 
 
@@ -1268,6 +1270,7 @@ def _soften_stars(
             "catalog_source_id": star.catalog_source_id,
             "catalog_g_magnitude": round(float(star.catalog_g_mag), 1) if star.catalog_g_mag is not None else None,
             "catalog_name": star.catalog_name,
+            "catalog_position_state": star.catalog_position_state,
             "catalog_ra_deg": round(float(star.catalog_ra_deg), 7) if star.catalog_ra_deg is not None else None,
             "catalog_dec_deg": round(float(star.catalog_dec_deg), 7) if star.catalog_dec_deg is not None else None,
             "catalog_bp_rp_colour_index": round(float(star.catalog_bp_rp), 5) if star.catalog_bp_rp is not None else None,
@@ -1431,7 +1434,8 @@ def _brightest_star_crops(
             delta_m = -2.5 * math.log10(max(float(star.relative_flux_ratio), 1e-20))
             brightness = f"dm={delta_m:.1f} mag"
         name = star.catalog_name or f"SEP source {section_index}"
-        caption = f"{section} {section_index} | {name[:36]} | {brightness}"
+        source_kind = "W08-guided" if star.catalog_position_state == "recovered" else "image-confirmed"
+        caption = f"{section} {section_index} | {name[:28]} | {brightness} | {source_kind}"
         result.append(((x0, y0, x1, y1), crop, star, caption))
     return result
 
@@ -1539,7 +1543,7 @@ def _coverage_svg(
         '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="420" viewBox="0 0 600 420">',
         '<rect width="600" height="420" rx="12" fill="#0a0b10"/>',
         '<text x="18" y="24" fill="#d7c9f5" font-family="Segoe UI, sans-serif" font-size="12" font-weight="600">IMAGE FRAME · 4 × 3 COVERAGE</text>',
-        f'<text x="18" y="42" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">W08 G ≤ {magnitude_ceiling:.1f} | cell: confirmed / projected | blue outline: model only</text>' if math.isfinite(reference_g) else '<text x="18" y="42" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">Image detections only | no validated catalog projection</text>',
+        f'<text x="18" y="42" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">W08 G ≤ {magnitude_ceiling:.1f} | cell: confirmed / projected; amber projected points are not softened</text>' if math.isfinite(reference_g) else '<text x="18" y="42" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">Image detections only | no validated catalog projection</text>',
         f'<rect x="{frame_x:.2f}" y="{frame_y:.2f}" width="{frame_width:.2f}" height="{frame_height:.2f}" rx="2" fill="#11151e" stroke="#68617f" stroke-width="1.4"/>',
     ]
     for area in coverage_areas:
@@ -1599,7 +1603,7 @@ def _coverage_svg(
         )
     else:
         svg.append(
-            '<text x="18" y="405" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">Empty cells have no projected W08 candidate; they do not certify star-free sky.</text>'
+            '<text x="18" y="405" fill="#98a0b4" font-family="Segoe UI, sans-serif" font-size="10">Green = WCS-guided image source recovered and softened; amber = projection only.</text>'
         )
     svg.append("</svg>")
     verified = sum(position.state in {"detected", "recovered"} for position in catalog_positions)
@@ -1893,7 +1897,9 @@ def process_raw(
                 catalog_name=match.name,
                 catalog_ra_deg=match.ra_deg,
                 catalog_dec_deg=match.dec_deg,
-            ), match.g_mag, False)
+                catalog_position_state="recovered" if match.position_recovered else "detected",
+                catalog_position_recovered=match.position_recovered,
+            ), match.g_mag, match.position_recovered)
             for index, match in catalog_matches.items()
             if 0 <= index < len(detector_stars)
         ]
@@ -1920,11 +1926,11 @@ def process_raw(
                 source.name,
                 source.ra_deg,
                 source.dec_deg,
+                catalog_position_state="recovered",
             ),
             source.g_mag,
             True,
         ) for source in recovered_sources)
-
     stars, selected_count, catalog_reference_g_mag, recovered_catalog_star_count = _select_stars(
         detector_stars, catalog_entries, brightness_source, relative_magnitude_limit
     )
@@ -1945,12 +1951,16 @@ def process_raw(
     )
     catalog_verified_count = sum(position.state in {"detected", "recovered"} for position in in_range_catalog_positions)
     catalog_unverified_count = sum(position.state == "predicted" for position in in_range_catalog_positions)
+    catalog_guided_recovered_count = sum(
+        star.catalog_position_state == "recovered" for star in stars
+    ) if brightness_source == "catalog" else 0
     if brightness_source == "catalog":
         report(
             61,
             f"SEP 实测 {candidate_count:,} 个点源候选；ΔG≤{relative_magnitude_limit:.1f} 的星表候选 "
             f"{len(in_range_catalog_positions):,} 个，"
-            f"图像确认 {catalog_verified_count:,} 个，另 {catalog_unverified_count:,} 个无点源证据、不柔焦；"
+            f"图像确认 {catalog_verified_count:,} 个，其中星表引导回搜补回 {catalog_guided_recovered_count:,} 个；"
+            f"另 {catalog_unverified_count:,} 个无点源证据，仅保留为推算候选、不柔焦；"
             f"本次柔焦 {selected_count:,} 个…",
         )
     else:
@@ -2091,13 +2101,14 @@ def process_raw(
         "focal_length_35mm_equivalent": info.focal_length_35mm,
         "sensor_format": info.sensor_format or "auto",
         "aperture": info.aperture,
-        "detected_stars": len(stars),
+        "detected_stars": sum(star.catalog_position_state in {"detected", "recovered"} for star in stars) if brightness_source == "catalog" else len(stars),
+        "soft_focus_center_count": len(stars),
         "point_source_candidates": candidate_count,
         "brightness_source": brightness_source,
         "brightness_source_label": "真实星表亮度" if brightness_source == "catalog" else "图像解析星点亮度",
         "star_detection": "SEP local background/RMS, PSF matched extraction, circular aperture flux",
         "star_selection": (
-            "ASTAP W08 Gaia-derived G magnitudes rounded to 0.1 mag; select matched and WCS-position-recovered point sources within delta G of the brightest local catalogue match"
+            "ASTAP W08 Gaia-derived G magnitudes rounded to 0.1 mag; select image-confirmed and WCS-guided recovered point sources within delta G of the brightest selected in-frame source"
             if brightness_source == "catalog"
             else "1.4.7 SEP circular-aperture image photometry; select point sources within delta m of the brightest detected sky source"
         ),
@@ -2111,14 +2122,15 @@ def process_raw(
         "catalog_projected_candidate_count": catalog_prediction_count,
         "catalog_image_confirmed_candidate_count": catalog_verified_count,
         "catalog_unconfirmed_projected_candidate_count_not_softened": catalog_unverified_count,
+        "catalog_wcs_guided_recovered_soft_focus_center_count": catalog_guided_recovered_count,
         "catalog_reference_g_magnitude": round(catalog_reference_g_mag, 5) if catalog_reference_g_mag is not None else None,
         "catalog_photometry_fields": ["Gaia-derived G magnitude (W08, 0.1 mag resolution)" ] if brightness_source == "catalog" else [],
         "catalog_name_source": "HYG v4.1 common names/Bayer-Flamsteed designations matched to W08 sky coordinates; RA/Dec fallback where no name matches" if brightness_source == "catalog" else None,
-        "partial_coverage_policy": "WCS/catalog predictions without a local compact-source image signal appear in the coverage map but are not softened. Direct SEP sources and catalog-position-guided local SEP recoveries are softened if their measured W08 G is within the selected delta range.",
+        "partial_coverage_policy": "Coverage counts image-confirmed and catalog-projected W08 positions separately. Validated WCS projections guide a wider local search; only a compact image source found by SEP at or near a projected position is added as a recovered soft-focus center. Projections without compact-source image evidence remain visible in the map and are not softened. Sky-mask foreground positions are excluded.",
         "relative_magnitude_limit": relative_magnitude_limit,
         "relative_flux_floor_ratio": round(10.0 ** (-0.4 * relative_magnitude_limit), 8),
         "relative_magnitude_difference_definition": (
-            "delta_G=local W08 G magnitude minus the brightest detected or position-recovered W08 source; include sources where delta_G is at most the selected limit"
+            "delta_G=local W08 G magnitude minus the brightest image-confirmed or WCS-guided recovered source; include sources where delta_G is at most the selected limit"
             if brightness_source == "catalog"
             else "delta_m=-2.5*log10(SEP circular-aperture flux / brightest detected SEP aperture flux); include sources where delta_m is at most the selected limit"
         ),
@@ -2205,5 +2217,6 @@ def process_raw(
         catalog_prediction_count=catalog_prediction_count,
         catalog_verified_count=catalog_verified_count,
         catalog_unverified_count=catalog_unverified_count,
+        catalog_guided_recovered_count=catalog_guided_recovered_count,
         analysis=analysis,
     )
