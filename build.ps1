@@ -48,7 +48,7 @@ try {
 
     Push-Location $project
     try {
-        & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --distpath $distDir --workpath $workDir --specpath $buildRoot --collect-all rawpy --collect-all sep --collect-all tifffile --collect-all astropy --collect-all seiza --add-data $dataArgument --add-data $starNamesArgument app.py
+        & $python -m PyInstaller --noconfirm --clean --onefile --windowed --name "星点柔焦" --distpath $distDir --workpath $workDir --specpath $buildRoot --collect-all rawpy --collect-all sep --collect-all tifffile --collect-all seiza --exclude-module astropy.tests --exclude-module astropy.visualization --add-data $dataArgument --add-data $starNamesArgument app.py
         if ($LASTEXITCODE -ne 0) { throw "PyInstaller 打包失败。" }
     } finally {
         Pop-Location

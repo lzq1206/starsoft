@@ -26,7 +26,8 @@ mkdir -p "$DIST_DIR" "$WORK_DIR" "$PACKAGE_DIR/星点柔焦-v${VERSION}-macos-${
   --noconfirm --clean --windowed --name "星点柔焦" \
   --distpath "$DIST_DIR" --workpath "$WORK_DIR" \
   --collect-all rawpy --collect-all sep --collect-all tifffile \
-  --collect-all astropy --collect-all seiza \
+  --collect-all seiza --exclude-module astropy.tests \
+  --exclude-module astropy.visualization \
   --add-data "$ROOT_DIR/ui/index.html:ui" \
   --add-data "$ROOT_DIR/data/hyg_named_stars.csv:data" "$ROOT_DIR/app.py"
 
