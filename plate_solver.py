@@ -22,8 +22,11 @@ from urllib.request import Request, urlopen
 import numpy as np
 import sep
 import tifffile
+import astropy.units as u
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import WCS, Sip
+from astropy.wcs.utils import fit_wcs_from_points
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
@@ -283,6 +286,12 @@ class CameraProjection:
     center_x: float
     center_y: float
     residual_p90_px: float
+    distortion: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    validation_count: int = 0
+    # A validated TAN-SIP model is the preferred wide-field mapping.  The
+    # Brown model above remains as a compact fallback for cameras for which a
+    # global SIP fit cannot be justified by held-out stars.
+    sip_wcs: WCS | None = None
 
 
 @dataclass(frozen=True)
@@ -341,8 +350,8 @@ def _fit_wide_camera_projection(
         if not (0 <= det_id < len(stars)) or match.separation_arcsec > maximum_separation:
             continue
         star = stars[det_id]
-        x = float(getattr(star, "x")) * scale_x
-        y = float(getattr(star, "y")) * scale_y
+        x = (float(getattr(star, "x")) + 0.5) * scale_x - 0.5
+        y = (float(getattr(star, "y")) + 0.5) * scale_y - 0.5
         if not (seed_tile.x0 <= x < seed_tile.x1 and seed_tile.y0 <= y < seed_tile.y1):
             continue
         if not (math.isfinite(x) and math.isfinite(y)):
@@ -522,6 +531,85 @@ _ORION_BELT_J2000_DEG = np.asarray([
 ], dtype=np.float64)
 
 
+def _distort_camera_xy(xy: np.ndarray, coefficients: tuple[float, ...]) -> np.ndarray:
+    """Brown radial (k1,k2) and tangential (p1,p2) camera distortion.
+
+    Equations: https://docs.opencv.org/4.13.0/dc/dbb/tutorial_py_calibration.html
+    Coordinates are dimensionless x/z,y/z rays, never image channel values.
+    """
+    x, y = np.asarray(xy, dtype=np.float64).T
+    k1, k2, p1, p2 = coefficients
+    r2 = x*x + y*y
+    radial = 1.0 + k1*r2 + k2*r2*r2
+    return np.column_stack((x*radial + 2*p1*x*y + p2*(r2 + 2*x*x),
+                            y*radial + p1*(r2 + 2*y*y) + 2*p2*x*y))
+
+
+def _undistort_camera_xy(xy: np.ndarray, coefficients: tuple[float, ...]) -> np.ndarray:
+    """Invert the same Brown model with Newton iterations; reject non-convergence."""
+    target = np.asarray(xy, dtype=np.float64)
+    result = target.copy()
+    k1, k2, p1, p2 = coefficients
+    if not any(coefficients):
+        return result
+    for _ in range(25):
+        x, y = result.T
+        r2 = x*x + y*y
+        radial = 1 + k1*r2 + k2*r2*r2
+        dx, dy = 2*x*(k1+2*k2*r2), 2*y*(k1+2*k2*r2)
+        a = radial + x*dx + 2*p1*y + 6*p2*x
+        b = x*dy + 2*p1*x + 2*p2*y
+        c = y*dx + 2*p1*x + 2*p2*y
+        d = radial + y*dy + 6*p1*y + 2*p2*x
+        error = _distort_camera_xy(result, coefficients) - target
+        det = a*d-b*c
+        safe = np.where(np.abs(det)>1e-12, det, np.nan)
+        step = np.column_stack(((d*error[:,0]-b*error[:,1])/safe,
+                                (a*error[:,1]-c*error[:,0])/safe))
+        result -= np.clip(step, -0.25, 0.25)
+        if np.all(np.linalg.norm(error, axis=1) < 1e-10):
+            break
+    valid = np.linalg.norm(_distort_camera_xy(result, coefficients)-target, axis=1) < 1e-8
+    result[~valid] = np.nan
+    return result
+
+
+def _catalog_vectors_to_sky(vectors: np.ndarray) -> SkyCoord:
+    """Convert unit vectors from the bundled W08 index to ICRS coordinates."""
+    values = np.asarray(vectors, dtype=np.float64)
+    ra = np.degrees(np.arctan2(values[:, 1], values[:, 0])) % 360.0
+    dec = np.degrees(np.arcsin(np.clip(values[:, 2], -1.0, 1.0)))
+    return SkyCoord(ra * u.deg, dec * u.deg, frame="icrs")
+
+
+def _sip_world_to_solver_pixels(
+    wcs: WCS,
+    vectors: np.ndarray,
+    image_height: int,
+) -> np.ndarray:
+    """Project sky vectors through a TAN-SIP WCS into the top-left image frame."""
+    sky = _catalog_vectors_to_sky(vectors)
+    with np.errstate(all="ignore"):
+        coordinates = np.column_stack(
+            wcs.all_world2pix(sky.ra.deg, sky.dec.deg, 0, quiet=True)
+        )
+    coordinates[:, 1] = (image_height - 1) - coordinates[:, 1]
+    return np.asarray(coordinates, dtype=np.float64)
+
+
+def _sip_solver_pixels_to_world(
+    wcs: WCS,
+    pixels: np.ndarray,
+    image_height: int,
+) -> np.ndarray:
+    """Convert top-left solver pixels through a TAN-SIP WCS to RA/Dec degrees."""
+    coordinates = np.asarray(pixels, dtype=np.float64).copy()
+    coordinates[:, 1] = (image_height - 1) - coordinates[:, 1]
+    with np.errstate(all="ignore"):
+        world = np.asarray(wcs.all_pix2world(coordinates, 0), dtype=np.float64)
+    return world
+
+
 def _project_camera_catalog(
     vectors: np.ndarray,
     projection: CameraProjection,
@@ -530,18 +618,27 @@ def _project_camera_catalog(
     sensor_width_mm: float,
     sensor_height_mm: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Project sky directions through the fitted rectilinear camera model."""
+    """Project sky directions with fitted principal point and lens distortion."""
     camera_vectors = np.asarray(vectors, dtype=np.float64) @ projection.orientation
     z = camera_vectors[:, 2]
+    if projection.sip_wcs is not None:
+        # ASTAP and Seiza both use SIP for wide-field residual distortion. A
+        # single validated TAN-SIP model is more stable at the frame edges
+        # than extrapolating a pinhole model with one radial coefficient.
+        projected = _sip_world_to_solver_pixels(
+            projection.sip_wcs, vectors, image_height
+        )
+        # The SIP WCS itself defines the valid sky footprint.  A model built
+        # from local tile matches has no meaningful pinhole orientation, so do
+        # not discard its valid edge coordinates using the wrapper pose.
+        return projected, np.ones(len(projected), dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        x = projection.center_x + (
-            projection.focal_mm * camera_vectors[:, 0]
-            / np.maximum(z, 1e-9) * image_width / sensor_width_mm
-        )
-        y = projection.center_y - (
-            projection.focal_mm * camera_vectors[:, 1]
-            / np.maximum(z, 1e-9) * image_height / sensor_height_mm
-        )
+        normalized = camera_vectors[:, :2] / np.maximum(z[:, None], 1e-9)
+        # Directions behind the sensor cannot yield image positions.
+        normalized[z <= 0] = np.nan
+        distorted = _distort_camera_xy(normalized, projection.distortion)
+        x = projection.center_x + projection.focal_mm * distorted[:,0] * image_width / sensor_width_mm
+        y = projection.center_y - projection.focal_mm * distorted[:,1] * image_height / sensor_height_mm
     return np.column_stack((x, y)), z
 
 
@@ -612,6 +709,505 @@ def _camera_catalog_pairs(
     return accepted
 
 
+def _fit_global_sip_wcs(
+    projection: CameraProjection,
+    stars: Sequence[object],
+    catalog_magnitudes: np.ndarray,
+    catalog_vectors: np.ndarray,
+    detector_shape: tuple[int, int],
+    detector_scale_xy: tuple[float, float],
+    sky_mask: np.ndarray | None,
+    info: object,
+    progress: Progress | None = None,
+) -> CameraProjection:
+    """Fit a guarded global TAN-SIP model from a verified camera pose.
+
+    ASTAP documents third-order SIP as the distortion model used for accurate
+    wide-field positions.  The camera pose supplies the initial catalogue to
+    source association; only isolated, one-to-one associations close to that
+    pose are used, and source IDs divisible by five are held out from the fit.
+    The model is accepted only when the held-out residual improves and the
+    validation stars cover the frame.  A failed or ambiguous fit returns the
+    original projection unchanged.
+    """
+    if projection.sip_wcs is not None:
+        return projection
+    detector_height, detector_width = detector_shape
+    scale_x, scale_y = detector_scale_xy
+    image_width = max(1, int(round(detector_width * scale_x)))
+    image_height = max(1, int(round(detector_height * scale_y)))
+
+    source_ids: list[int] = []
+    source_pixels: list[tuple[float, float]] = []
+    for source_id, star in enumerate(stars):
+        x, y = float(getattr(star, "x")), float(getattr(star, "y"))
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        if not (0.0 <= x < detector_width and 0.0 <= y < detector_height):
+            continue
+        detector_x, detector_y = int(round(x)), int(round(y))
+        detector_x = min(max(detector_x, 0), detector_width - 1)
+        detector_y = min(max(detector_y, 0), detector_height - 1)
+        if (
+            sky_mask is not None
+            and sky_mask.shape == detector_shape
+            and bool(sky_mask[detector_y, detector_x])
+        ):
+            continue
+        source_ids.append(source_id)
+        source_pixels.append(((x + 0.5) * scale_x - 0.5,
+                              (y + 0.5) * scale_y - 0.5))
+    if len(source_ids) < 80:
+        return projection
+    source_ids_array = np.asarray(source_ids, dtype=np.intp)
+    source_pixels_array = np.asarray(source_pixels, dtype=np.float64)
+    source_row_by_id = {
+        int(source_id): row for row, source_id in enumerate(source_ids_array)
+    }
+    source_tree = cKDTree(source_pixels_array)
+
+    # Start with a radius that is tied to the independently verified pose.
+    # The wider search only gathers candidates; the tighter limit below is
+    # what protects the SIP fit from unrelated stars in crowded regions.
+    pose_p90 = float(projection.residual_p90_px)
+    candidate_radius = float(np.clip(
+        max(8.0, 2.0 * pose_p90 + 2.0) if math.isfinite(pose_p90) else 12.0,
+        8.0, 14.0,
+    ))
+    pairs = _camera_catalog_pairs(
+        catalog_magnitudes,
+        catalog_vectors,
+        projection,
+        source_pixels_array,
+        source_ids_array,
+        source_tree,
+        detector_shape,
+        detector_scale_xy,
+        sky_mask,
+        candidate_radius,
+        info,
+    )
+    if len(pairs) < 80:
+        return projection
+
+    catalog_rows = np.asarray([pair[1] for pair in pairs], dtype=np.intp)
+    projected, _ = _project_camera_catalog(
+        catalog_vectors[catalog_rows],
+        projection,
+        image_width,
+        image_height,
+        *_sensor_dimensions(info, detector_shape)[:2],
+    )
+    nearest_distances, _ = source_tree.query(projected, k=2)
+    fit_radius = float(np.clip(
+        max(5.5, pose_p90 + 1.0) if math.isfinite(pose_p90) else 8.0,
+        5.5, 8.0,
+    ))
+    candidates: list[tuple[float, int, int]] = []
+    for pair, nearest in zip(pairs, nearest_distances):
+        distance, catalog_row, source_id = pair
+        second = float(nearest[1])
+        if not math.isfinite(distance) or distance > fit_radius:
+            continue
+        # A nearest source that is nearly tied with another source is not a
+        # reliable identity for lens fitting, especially near the Milky Way.
+        if math.isfinite(second) and distance >= 0.75 * second:
+            continue
+        candidates.append((float(distance), int(catalog_row), int(source_id)))
+    if len(candidates) < 60:
+        return projection
+
+    # Keep the fit spatially balanced. Without this cap the dense central
+    # Milky Way can dominate a SIP polynomial and leave the corners drifting.
+    buckets: dict[tuple[int, int], list[tuple[float, int, int]]] = {}
+    for candidate in candidates:
+        source_row = source_row_by_id.get(candidate[2])
+        if source_row is None:
+            continue
+        x, y = source_pixels_array[source_row]
+        cell = (
+            int(np.clip(x / max(image_width, 1) * 4.0, 0, 3)),
+            int(np.clip(y / max(image_height, 1) * 3.0, 0, 2)),
+        )
+        buckets.setdefault(cell, []).append(candidate)
+    if len(buckets) < 6:
+        return projection
+    selected: list[tuple[float, int, int]] = []
+    for bucket in buckets.values():
+        bucket.sort(key=lambda item: (item[0], float(catalog_magnitudes[item[1]])))
+        # Keep enough points from dense central cells for a stable SIP fit;
+        # the global cap below still prevents a crowded field from dominating.
+        selected.extend(bucket[:80])
+    selected.sort(key=lambda item: (item[0], float(catalog_magnitudes[item[1]])))
+    selected = selected[:260]
+    if len(selected) < 60:
+        return projection
+
+    selected_source_ids = np.asarray([item[2] for item in selected], dtype=np.intp)
+    selected_catalog_rows = np.asarray([item[1] for item in selected], dtype=np.intp)
+    selected_distances = np.asarray([item[0] for item in selected], dtype=np.float64)
+    selected_pixels = source_pixels_array[
+        [source_row_by_id[int(source_id)] for source_id in selected_source_ids]
+    ]
+    validation_mask = (selected_source_ids % 5) == 0
+    training_mask = ~validation_mask
+    if np.count_nonzero(training_mask) < 50 or np.count_nonzero(validation_mask) < 12:
+        return projection
+    validation_pixels = selected_pixels[validation_mask]
+    validation_vectors = catalog_vectors[selected_catalog_rows[validation_mask]]
+    before = selected_distances[validation_mask]
+    occupied_validation = set(zip(
+        np.clip((validation_pixels[:, 0] / image_width * 4).astype(int), 0, 3),
+        np.clip((validation_pixels[:, 1] / image_height * 3).astype(int), 0, 2),
+    ))
+    if len(occupied_validation) < 5:
+        return projection
+
+    training_pixels = selected_pixels[training_mask]
+    training_vectors = catalog_vectors[selected_catalog_rows[training_mask]]
+    try:
+        sip_wcs = fit_wcs_from_points(
+            (
+                training_pixels[:, 0] + 1.0,
+                image_height - training_pixels[:, 1],
+            ),
+            _catalog_vectors_to_sky(training_vectors),
+            proj_point="center",
+            projection="TAN",
+            sip_degree=3,
+        )
+        sip_wcs.pixel_shape = (image_width, image_height)
+        sip_wcs.array_shape = (image_height, image_width)
+    except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError):
+        return projection
+
+    try:
+        after = np.linalg.norm(
+            _sip_world_to_solver_pixels(sip_wcs, validation_vectors, image_height)
+            - validation_pixels,
+            axis=1,
+        )
+        all_after = np.linalg.norm(
+            _sip_world_to_solver_pixels(
+                sip_wcs,
+                catalog_vectors[selected_catalog_rows],
+                image_height,
+            )
+            - selected_pixels,
+            axis=1,
+        )
+    except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError):
+        return projection
+    if not np.isfinite(after).all() or not np.isfinite(all_after).all():
+        return projection
+    p90_before = float(np.percentile(before, 90.0))
+    p90_after = float(np.percentile(after, 90.0))
+    p90_all_after = float(np.percentile(all_after, 90.0))
+    edge = (
+        (np.abs(validation_pixels[:, 0] / image_width - 0.5) > 0.30)
+        | (np.abs(validation_pixels[:, 1] / image_height - 0.5) > 0.30)
+    )
+    edge_ok = (
+        np.count_nonzero(edge) < 6
+        or float(np.percentile(after[edge], 90.0)) <=
+        # Edge associations are the least certain in a very wide frame. Keep
+        # a bounded absolute margin so a SIP model is not rejected merely
+        # because a few edge detections are noisier than the centre, while
+        # still rejecting a model that sends the corners far away.
+        max(5.0, float(np.percentile(before[edge], 90.0)) + 3.0)
+    )
+    # The held-out improvement is the gate.  The all-pair check catches a
+    # polynomial that fits the selected stars while folding between them.
+    if (
+        p90_after > max(2.0, 0.92 * p90_before)
+        or p90_all_after > max(7.0, 1.15 * p90_before)
+        or float(np.median(after)) > float(np.median(before)) + 0.75
+        or not edge_ok
+    ):
+        return projection
+    accepted = replace(
+        projection,
+        residual_p90_px=p90_after,
+        validation_count=int(np.count_nonzero(validation_mask)),
+        sip_wcs=sip_wcs,
+    )
+    if progress:
+        progress(
+            55,
+            f"广角第三阶 SIP 畸变拟合通过 {int(np.count_nonzero(validation_mask))} 颗留出星复核："
+            f"P90 {p90_before:.2f} → {p90_after:.2f} solver px，"
+            f"覆盖 {len(buckets)} 个图像分区。",
+        )
+    return accepted
+
+
+def _fit_global_sip_from_matches(
+    stars: Sequence[object],
+    matches: dict[int, CatalogMatch],
+    catalog_vectors: np.ndarray,
+    detector_shape: tuple[int, int],
+    detector_scale_xy: tuple[float, float],
+    sky_mask: np.ndarray | None,
+    info: object,
+    pixel_scale_arcsec: float,
+    progress: Progress | None = None,
+) -> CameraProjection | None:
+    """Build a full-frame SIP model from overlapping local-WCS matches.
+
+    This path is used when local ASTAP/Seiza tiles are trustworthy but no
+    single full-frame camera pose was obtained.  The tile matches already
+    carry an independent sky association, so a global SIP fit can join their
+    coordinate frames and extrapolate only after a held-out validation.
+    """
+    detector_height, detector_width = detector_shape
+    scale_x, scale_y = detector_scale_xy
+    image_width = max(1, int(round(detector_width * scale_x)))
+    image_height = max(1, int(round(detector_height * scale_y)))
+    source_ids: list[int] = []
+    catalog_rows: list[int] = []
+    pixels: list[tuple[float, float]] = []
+    separations: list[float] = []
+    for source_id, match in matches.items():
+        row = match.catalog_row_index
+        if row is None or not (0 <= int(row) < len(catalog_vectors)):
+            continue
+        separation = float(match.separation_arcsec)
+        # Local WCS matches are normally much tighter than this. A generous
+        # ceiling accommodates a very wide tile while excluding the broad
+        # nearest-neighbour tail that would bend a global polynomial.
+        if not math.isfinite(separation) or separation > 200.0:
+            continue
+        if not (0 <= int(source_id) < len(stars)):
+            continue
+        star = stars[int(source_id)]
+        x, y = float(getattr(star, "x")), float(getattr(star, "y"))
+        if not (math.isfinite(x) and math.isfinite(y)):
+            continue
+        if not (0.0 <= x < detector_width and 0.0 <= y < detector_height):
+            continue
+        ix, iy = int(round(x)), int(round(y))
+        ix = min(max(ix, 0), detector_width - 1)
+        iy = min(max(iy, 0), detector_height - 1)
+        if (
+            sky_mask is not None
+            and sky_mask.shape == detector_shape
+            and bool(sky_mask[iy, ix])
+        ):
+            continue
+        source_ids.append(int(source_id))
+        catalog_rows.append(int(row))
+        pixels.append(((x + 0.5) * scale_x - 0.5,
+                       (y + 0.5) * scale_y - 0.5))
+        separations.append(separation)
+    if len(source_ids) < 60:
+        return None
+    source_ids_array = np.asarray(source_ids, dtype=np.intp)
+    catalog_rows_array = np.asarray(catalog_rows, dtype=np.intp)
+    pixels_array = np.asarray(pixels, dtype=np.float64)
+    separations_array = np.asarray(separations, dtype=np.float64)
+    validation_mask = (source_ids_array % 5) == 0
+    training_mask = ~validation_mask
+    if (
+        np.count_nonzero(training_mask) < 48
+        or np.count_nonzero(validation_mask) < 12
+    ):
+        return None
+    occupied = set(zip(
+        np.clip((pixels_array[:, 0] / image_width * 4).astype(int), 0, 3),
+        np.clip((pixels_array[:, 1] / image_height * 3).astype(int), 0, 2),
+    ))
+    if len(occupied) < 5:
+        return None
+    try:
+        sip_wcs = fit_wcs_from_points(
+            (
+                pixels_array[training_mask, 0] + 1.0,
+                image_height - pixels_array[training_mask, 1],
+            ),
+            _catalog_vectors_to_sky(catalog_vectors[catalog_rows_array[training_mask]]),
+            proj_point="center",
+            projection="TAN",
+            sip_degree=3,
+        )
+        sip_wcs.pixel_shape = (image_width, image_height)
+        sip_wcs.array_shape = (image_height, image_width)
+        predicted = _sip_world_to_solver_pixels(
+            sip_wcs,
+            catalog_vectors[catalog_rows_array],
+            image_height,
+        )
+    except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError):
+        return None
+    errors = np.linalg.norm(predicted - pixels_array, axis=1)
+    if not np.isfinite(errors).all():
+        return None
+    validation_errors = errors[validation_mask]
+    p90 = float(np.percentile(validation_errors, 90.0))
+    p90_all = float(np.percentile(errors, 90.0))
+    median = float(np.median(validation_errors))
+    edge = (
+        (np.abs(pixels_array[validation_mask, 0] / image_width - 0.5) > 0.30)
+        | (np.abs(pixels_array[validation_mask, 1] / image_height - 0.5) > 0.30)
+    )
+    edge_p90 = float(np.percentile(validation_errors[edge], 90.0)) if np.any(edge) else 0.0
+    # The local WCS already supplied a sky identity; absolute pixel residuals
+    # and spatial spread are therefore sufficient gates for this fallback.
+    if (
+        p90 > max(6.0, 0.50 * image_width / max(image_width, image_height))
+        or p90_all > 10.0
+        or median > 4.0
+        or (np.any(edge) and edge_p90 > 12.0)
+        or float(np.ptp(pixels_array[:, 0])) < image_width * 0.30
+        or float(np.ptp(pixels_array[:, 1])) < image_height * 0.18
+    ):
+        return None
+    # The wrapper's pinhole fields are used only for diagnostics and for the
+    # z-coordinate placeholder; SIP itself supplies the pixel mapping.
+    _sensor_width, _sensor_height, focal_mm = _sensor_dimensions(info, detector_shape)
+    accepted = CameraProjection(
+        orientation=np.eye(3, dtype=np.float64),
+        focal_mm=float(focal_mm),
+        center_x=image_width * 0.5,
+        center_y=image_height * 0.5,
+        residual_p90_px=p90,
+        validation_count=int(np.count_nonzero(validation_mask)),
+        sip_wcs=sip_wcs,
+    )
+    if progress:
+        progress(
+            55,
+            f"局部 WCS 重叠点已合成为第三阶 SIP 全幅模型："
+            f"{int(np.count_nonzero(validation_mask))} 颗留出星 P90 {p90:.2f} solver px，"
+            f"覆盖 {len(occupied)} 个图像分区。",
+        )
+    return accepted
+
+
+def _refine_camera_distortion(
+    projection: CameraProjection,
+    stars: Sequence[object],
+    catalog_magnitudes: np.ndarray,
+    catalog_vectors: np.ndarray,
+    detector_shape: tuple[int, int],
+    detector_scale_xy: tuple[float, float],
+    sky_mask: np.ndarray | None,
+    info: object,
+    progress: Progress | None = None,
+) -> CameraProjection:
+    """Refine a verified pose with Brown distortion and fixed held-out stars.
+
+    All residuals are measured in solver pixels. Source IDs divisible by five
+    are withheld from every fit, including rematching iterations. The original
+    validation associations remain fixed, so clipping/rematching cannot make
+    a poor fit look accurate merely by throwing away its difficult stars.
+    """
+    height, width = detector_shape
+    sx, sy = detector_scale_xy
+    full_width, full_height = round(width*sx), round(height*sy)
+    sensor_w, sensor_h, _ = _sensor_dimensions(info, detector_shape)
+    scale = math.sqrt(sx*sy)
+    ids, pixels = [], []
+    for sid, star in enumerate(stars):
+        x, y = float(getattr(star, "x")), float(getattr(star, "y"))
+        if not (math.isfinite(x) and math.isfinite(y) and 0 <= x < width and 0 <= y < height):
+            continue
+        if sky_mask is not None and sky_mask[min(round(y),height-1), min(round(x),width-1)]:
+            continue
+        ids.append(sid)
+        pixels.append(((x+.5)*sx-.5, (y+.5)*sy-.5))
+    if len(ids) < 60:
+        return projection
+    ids = np.asarray(ids, dtype=np.intp)
+    pixels = np.asarray(pixels, dtype=np.float64)
+    by_id = {int(sid): row for row, sid in enumerate(ids)}
+    source_tree = cKDTree(pixels)
+
+    def pairs_for(model: CameraProjection, radius: float) -> list[tuple[float, int, int]]:
+        pairs = _camera_catalog_pairs(catalog_magnitudes, catalog_vectors, model,
+            pixels, ids, source_tree, detector_shape, detector_scale_xy, sky_mask, radius, info)
+        if not pairs:
+            return []
+        rows = np.asarray([pair[1] for pair in pairs], dtype=np.intp)
+        expected, _ = _project_camera_catalog(catalog_vectors[rows], model,
+            full_width, full_height, sensor_w, sensor_h)
+        distances, _ = source_tree.query(expected, k=2)
+        # Avoid learning the lens from an ambiguous pair in a dense star field.
+        return [pair for pair, d in zip(pairs, distances) if d[0] < 0.65*d[1]]
+
+    original_pairs = pairs_for(projection, max(8.0, 4.0*scale))
+    validation = [pair for pair in original_pairs if pair[2] % 5 == 0]
+    if len(original_pairs) < 60 or len(validation) < 12:
+        return projection
+    validation_pixels = pixels[[by_id[pair[2]] for pair in validation]]
+    validation_vectors = catalog_vectors[[pair[1] for pair in validation]]
+    occupied = set(zip((validation_pixels[:,0]/full_width*4).astype(int),
+                       (validation_pixels[:,1]/full_height*3).astype(int)))
+    if len(occupied) < 5:
+        return projection
+
+    def errors(model: CameraProjection) -> np.ndarray:
+        predicted, _ = _project_camera_catalog(validation_vectors, model,
+            full_width, full_height, sensor_w, sensor_h)
+        return np.linalg.norm(predicted-validation_pixels, axis=1)
+
+    before = errors(projection)
+    initial = np.r_[np.zeros(6), projection.distortion]
+    lower = [-.08]*3 + [-.15, -.04, -.04, -.3, -.15, -.02, -.02]
+    upper = [.08]*3 + [.15, .04, .04, .3, .15, .02, .02]
+
+    def unpack(parameters: np.ndarray) -> CameraProjection:
+        return replace(projection,
+            orientation=Rotation.from_rotvec(parameters[:3]).as_matrix() @ projection.orientation,
+            focal_mm=projection.focal_mm*math.exp(parameters[3]),
+            center_x=projection.center_x+parameters[4]*full_width,
+            center_y=projection.center_y+parameters[5]*full_height,
+            distortion=tuple(float(value) for value in parameters[6:]))
+
+    model = projection
+    for radius in (max(8.0,4*scale), max(6.0,3*scale), max(4.0,2*scale)):
+        training = [pair for pair in pairs_for(model, radius) if pair[2] % 5 != 0]
+        if len(training) < 40:
+            return projection
+        targets = pixels[[by_id[pair[2]] for pair in training]]
+        vectors = catalog_vectors[[pair[1] for pair in training]]
+        # Equal weight per occupied image cell prevents the Milky Way core
+        # dominating the fit while corners receive almost no influence.
+        cells = (targets[:,0]/full_width*4).astype(int) + 4*(targets[:,1]/full_height*3).astype(int)
+        _, inverse, counts = np.unique(cells, return_inverse=True, return_counts=True)
+        weights = np.sqrt(np.median(counts)/counts[inverse])
+        def residual(parameters: np.ndarray) -> np.ndarray:
+            predicted, _ = _project_camera_catalog(vectors, unpack(parameters),
+                full_width, full_height, sensor_w, sensor_h)
+            return ((predicted-targets)*weights[:,None]/scale).ravel()
+        try:
+            fit = least_squares(residual, initial, bounds=(lower,upper),
+                loss="soft_l1", f_scale=1.0, x_scale="jac", max_nfev=150)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+            return projection
+        if not fit.success or not np.isfinite(fit.x).all():
+            return projection
+        initial, model = fit.x, unpack(fit.x)
+
+    after = errors(model)
+    p90_before, p90_after = np.percentile(before,90), np.percentile(after,90)
+    edge = (np.abs(validation_pixels[:,0]/full_width-.5) > .30) | (np.abs(validation_pixels[:,1]/full_height-.5) > .30)
+    edge_ok = np.count_nonzero(edge) < 6 or np.percentile(after[edge],90) <= np.percentile(before[edge],90)+.25*scale
+    # Reject folding/non-invertible extrapolation across the sensor radius.
+    max_r2 = (sensor_w**2 + sensor_h**2)/(4*model.focal_mm**2)
+    r2 = np.linspace(0, max_r2*1.3, 128)
+    k1,k2,_,_ = model.distortion
+    monotonic = np.all(1+3*k1*r2+5*k2*r2*r2 > .2)
+    if (not np.isfinite(after).all() or not monotonic or not edge_ok
+            or p90_after > min(2.0*scale, .90*p90_before)
+            or np.median(after) > np.median(before)):
+        return projection
+    model = replace(model, residual_p90_px=float(p90_after), validation_count=len(validation))
+    if progress:
+        progress(55, f"广角镜头畸变拟合通过 {len(validation)} 颗留出星复核："
+                     f"P90 {p90_before:.2f} → {p90_after:.2f} 原图像素。")
+    return model
+
+
 def _positions_from_camera_projection(
     stars: Sequence[object],
     detector: np.ndarray,
@@ -636,18 +1232,45 @@ def _positions_from_camera_projection(
             continue
         full_x = (x + 0.5) * scale_x - 0.5
         full_y = (y + 0.5) * scale_y - 0.5
-        ray = _camera_ray(
-            full_x, full_y, image_width, image_height,
-            sensor_width_mm, sensor_height_mm, projection.focal_mm,
-        )
+        if projection.sip_wcs is not None:
+            try:
+                world = _sip_solver_pixels_to_world(
+                    projection.sip_wcs,
+                    np.asarray([[full_x, full_y]], dtype=np.float64),
+                    image_height,
+                )[0]
+                ra, dec = float(world[0]) % 360.0, float(world[1])
+            except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError):
+                continue
+            if math.isfinite(ra) and math.isfinite(dec) and -90.0 <= dec <= 90.0:
+                positions.append((index, ra, dec))
+            continue
+        # The inverse must use the *fitted* principal point, just as the
+        # forward catalogue projection does. Using the image centre here
+        # silently assigns a different sky position to the same star.
+        normalized = _undistort_camera_xy(np.asarray([[
+            (full_x - projection.center_x) * sensor_width_mm / (image_width * projection.focal_mm),
+            (projection.center_y - full_y) * sensor_height_mm / (image_height * projection.focal_mm),
+        ]]), projection.distortion)[0]
+        ray = np.asarray([normalized[0], normalized[1], 1.0], dtype=np.float64)
+        ray /= np.linalg.norm(ray)
         world = ray @ projection.orientation.T
         ra = math.degrees(math.atan2(world[1], world[0])) % 360.0
         dec = math.degrees(math.asin(float(np.clip(world[2], -1.0, 1.0))))
         if math.isfinite(ra) and math.isfinite(dec):
             positions.append((index, ra, dec))
-    pixel_scale = math.degrees(math.atan2(
-        sensor_height_mm / image_height, projection.focal_mm
-    )) * 3600.0
+    if projection.sip_wcs is not None:
+        try:
+            matrix = np.asarray(projection.sip_wcs.pixel_scale_matrix, dtype=np.float64)
+            pixel_scale = math.sqrt(abs(float(np.linalg.det(matrix)))) * 3600.0
+        except (ValueError, RuntimeError, FloatingPointError, np.linalg.LinAlgError):
+            pixel_scale = math.degrees(math.atan2(
+                sensor_height_mm / image_height, projection.focal_mm
+            )) * 3600.0
+    else:
+        pixel_scale = math.degrees(math.atan2(
+            sensor_height_mm / image_height, projection.focal_mm
+        )) * 3600.0
     return positions, pixel_scale
 
 
@@ -1135,7 +1758,14 @@ def _seiza_wcs_on_solver_grid(
     detector_scale_xy: tuple[float, float],
     detector_shape: tuple[int, int],
 ) -> WCS:
-    """Convert Seiza's top-left detector WCS to ASTAP's bottom-left solver grid."""
+    """Change pixel frame without discarding the fitted SIP distortion.
+
+    Pixel centres obey s = (d + .5) * scale - .5. SIP polynomials act on
+    offsets from CRPIX, so under u'=sx*u, v'=-sy*v their coefficients obey
+    A'ij=sx*Aij/(sx**i*(-sy)**j), and likewise for B with multiplier -sy.
+    The same conjugation applies to the optional inverse AP/BP arrays.
+    See https://docs.astropy.org/en/stable/api/astropy.wcs.Sip.html.
+    """
     header = fits.Header()
     for key, value in seiza_wcs.fits_header_cards().items():
         header[str(key)] = value
@@ -1148,13 +1778,26 @@ def _seiza_wcs_on_solver_grid(
     solver_wcs.wcs.crval = detector_wcs.wcs.crval
     detector_height = max(int(detector_shape[0]), 1)
     solver_wcs.wcs.crpix = np.asarray([
-        (detector_wcs.wcs.crpix[0] - 1.0) * scale_x + 1.0,
-        (detector_height - detector_wcs.wcs.crpix[1] + 1.0) * scale_y,
+        (detector_wcs.wcs.crpix[0] - 0.5) * scale_x + 0.5,
+        round(detector_height * scale_y) + 0.5 - (detector_wcs.wcs.crpix[1] - 0.5) * scale_y,
     ])
     solver_wcs.wcs.cd = matrix @ np.diag([1.0 / scale_x, -1.0 / scale_y])
     solver_wcs.wcs.equinox = detector_wcs.wcs.equinox
     if detector_wcs.wcs.radesys:
         solver_wcs.wcs.radesys = detector_wcs.wcs.radesys
+    if detector_wcs.sip is not None:
+        def transform(coefficients: np.ndarray | None, output_scale: float) -> np.ndarray | None:
+            if coefficients is None:
+                return None
+            i, j = np.indices(coefficients.shape)
+            return coefficients * output_scale / (scale_x ** i * (-scale_y) ** j)
+
+        sip = detector_wcs.sip
+        solver_wcs.sip = Sip(
+            transform(sip.a, scale_x), transform(sip.b, -scale_y),
+            transform(sip.ap, scale_x), transform(sip.bp, -scale_y),
+            solver_wcs.wcs.crpix,
+        )
     solver_wcs.wcs.set()
     return solver_wcs
 
@@ -1743,9 +2386,12 @@ def _try_seiza_local_camera_fit(
                         inliers = [pair for pair in pairs if pair[0] <= 6.0]
                         if len(close_pairs) >= 24 and len(inliers) >= 40:
                             residuals = np.asarray([pair[0] for pair in inliers], dtype=np.float64)
-                            matched_xy = source_pixels_array[
-                                np.asarray([pair[2] for pair in close_pairs], dtype=np.intp)
-                            ]
+                            # Pair IDs index the original SEP list, not this
+                            # mask-filtered compact array.
+                            source_row_by_id = {int(sid): row for row, sid in enumerate(source_ids_array)}
+                            matched_xy = source_pixels_array[[
+                                source_row_by_id[pair[2]] for pair in close_pairs
+                            ]]
                             grid_x = np.clip((matched_xy[:, 0] / solver_width * 4).astype(np.intp), 0, 3)
                             grid_y = np.clip((matched_xy[:, 1] / solver_height * 4).astype(np.intp), 0, 3)
                             spatially_distributed = (
@@ -1836,8 +2482,8 @@ def _positions_from_solved_tiles(
     scale_x, scale_y = detector_scale_xy
     source_positions: list[tuple[int, float, float]] = []
     for index, star in enumerate(stars):
-        x = float(getattr(star, "x")) * scale_x
-        y = float(getattr(star, "y")) * scale_y
+        x = (float(getattr(star, "x")) + 0.5) * scale_x - 0.5
+        y = (float(getattr(star, "y")) + 0.5) * scale_y - 0.5
         valid_tiles = [
             tile for tile in successful_tiles
             if tile.x0 <= x < tile.x1 and tile.y0 <= y < tile.y1
@@ -2043,7 +2689,8 @@ def _catalog_confirmed_wide_tiles(
     scale_x, scale_y = detector_scale_xy
     detector_height, detector_width = detector.shape
     source_pixels = np.asarray([
-        (float(getattr(star, "x")) * scale_x, float(getattr(star, "y")) * scale_y)
+        ((float(getattr(star, "x")) + 0.5) * scale_x - 0.5,
+         (float(getattr(star, "y")) + 0.5) * scale_y - 0.5)
         for star in stars
     ], dtype=np.float64)
     valid_sources = np.isfinite(source_pixels).all(axis=1)
@@ -2393,8 +3040,8 @@ def _positions_to_sky(
 
     detector_stars_xy = np.asarray(
         [
-            (float(getattr(star, "x")) * detector_scale_x,
-             float(getattr(star, "y")) * detector_scale_y)
+            ((float(getattr(star, "x")) + 0.5) * detector_scale_x - 0.5,
+             (float(getattr(star, "y")) + 0.5) * detector_scale_y - 0.5)
             for star in stars
         ],
         dtype=np.float64,
@@ -3252,6 +3899,40 @@ def match_local_bright_stars(
     if not len(catalog_magnitudes):
         return {}, len(positions), [], (), coverage_areas
 
+    if known_camera_projection is not None:
+        # ASTAP/Seiza already supplied a catalogue-verified pose. Fit a
+        # global third-order TAN-SIP model before associating SEP detections;
+        # this is the same distortion family used by wide-field plate-solving
+        # tools and keeps edge stars on the correct side of the frame.
+        known_camera_projection = _fit_global_sip_wcs(
+            known_camera_projection,
+            stars,
+            catalog_magnitudes,
+            catalog_vectors,
+            detector.shape,
+            detector_scale_xy,
+            sky_mask,
+            info,
+            progress,
+        )
+        if known_camera_projection.sip_wcs is None:
+            known_camera_projection = _refine_camera_distortion(
+                known_camera_projection,
+                stars,
+                catalog_magnitudes,
+                catalog_vectors,
+                detector.shape,
+                detector_scale_xy,
+                sky_mask,
+                info,
+                progress,
+            )
+        sensor_w, sensor_h, _ = _sensor_dimensions(info, detector.shape)
+        positions, pixel_scale_arcsec = _positions_from_camera_projection(
+            stars, detector, sky_mask, detector_scale_xy,
+            (sensor_w, sensor_h), known_camera_projection,
+        )
+
     # W08 is an all-sky bright-star subset, complete to approximately G=8.
     # Its catalogue positions and rounded G magnitudes are bundled with the app;
     # matching therefore works offline and never sends the photograph or WCS.
@@ -3278,8 +3959,11 @@ def match_local_bright_stars(
     nearest_pairs: list[tuple[float, int, int]] = []
     if positions:
         source_vectors = _sky_unit_vectors(positions)
-        distances, row_indices = tree.query(source_vectors, k=1, distance_upper_bound=chord_limit)
-        for position, chord, row_index in zip(positions, distances, row_indices):
+        distances, row_indices = tree.query(source_vectors, k=2)
+        for position, chords, rows in zip(positions, distances, row_indices):
+            chord, row_index = float(chords[0]), int(rows[0])
+            if chord > chord_limit or chord >= 0.65*float(chords[1]):
+                continue
             row_index = int(row_index)
             if row_index >= len(catalog_magnitudes) or not math.isfinite(float(chord)):
                 continue
@@ -3301,6 +3985,35 @@ def match_local_bright_stars(
         used_detections.add(det_id)
         used_catalog_sources.add(row_index)
 
+    # When no full-frame camera pose was obtained, merge the independently
+    # solved local WCS matches into one guarded TAN-SIP model. This recovers
+    # wide-field corners without pretending that an uncovered region was
+    # solved when the overlap geometry is insufficient.
+    if known_camera_projection is None and not successful_tiles == [] and matches:
+        merged_projection = _fit_global_sip_from_matches(
+            stars,
+            matches,
+            catalog_vectors,
+            detector.shape,
+            detector_scale_xy,
+            sky_mask,
+            info,
+            pixel_scale_arcsec,
+            progress,
+        )
+        if merged_projection is not None:
+            known_camera_projection = merged_projection
+            coverage_areas = (
+                CatalogCoverageArea(
+                    0.0,
+                    0.0,
+                    float(detector_width),
+                    float(detector_height),
+                    "merged local SIP projection",
+                ),
+                *local_coverage_areas,
+            )
+
     reference_g = min((match.g_mag for match in matches.values()), default=math.inf)
     maximum_g = min(8.0, reference_g + float(relative_magnitude_limit) + 0.2)
     if not math.isfinite(reference_g):
@@ -3315,7 +4028,10 @@ def match_local_bright_stars(
     # Wide-angle lens distortion can leave bright edge stars several detector
     # pixels from the pinhole/WCS prior. Search farther around validated
     # projections, but still require an actual compact SEP source in the image.
-    recovery_radius_px = float(np.clip(query_radius_arcsec / max(detector_pixel_scale, 1e-8), 3.0, 18.0))
+    # A distant point source is not evidence that a catalogue identity is
+    # correct. Correct the projection, rather than searching up to 18 detector
+    # pixels and attaching the nearest unrelated star in a dense field.
+    recovery_radius_px = float(np.clip(query_radius_arcsec / max(detector_pixel_scale, 1e-8), 1.5, 4.0))
     detected_xy = np.asarray(
         [(float(getattr(star, "x")), float(getattr(star, "y"))) for star in stars],
         dtype=np.float64,
@@ -3389,13 +4105,31 @@ def match_local_bright_stars(
             full_x, full_y = tile.x0 + float(px), tile.y0 + float(py)
             previous = projected.get(int(row))
             if previous is None or edge_margin > previous[0]:
-                projected[int(row)] = (edge_margin, full_x / detector_scale_x, full_y / detector_scale_y)
+                projected[int(row)] = (edge_margin, (full_x + 0.5) / detector_scale_x - 0.5,
+                                      (full_y + 0.5) / detector_scale_y - 0.5)
 
     solver_width = max(1, int(round(detector.shape[1] * detector_scale_x)))
     solver_height = max(1, int(round(detector.shape[0] * detector_scale_y)))
     camera_projection = known_camera_projection or _fit_wide_camera_projection(
         stars, matches, successful_tiles, detector.shape, detector_scale_xy, info
     )
+    if camera_projection is not None and known_camera_projection is None:
+        camera_projection = _fit_global_sip_wcs(
+            camera_projection,
+            stars,
+            catalog_magnitudes,
+            catalog_vectors,
+            detector.shape,
+            detector_scale_xy,
+            sky_mask,
+            info,
+            progress,
+        )
+    if camera_projection is not None and camera_projection.sip_wcs is None:
+        camera_projection = _refine_camera_distortion(
+            camera_projection, stars, catalog_magnitudes, catalog_vectors,
+            detector.shape, detector_scale_xy, sky_mask, info, progress,
+        )
     if camera_projection is not None:
         sensor_width_mm, sensor_height_mm, _focal_mm = _sensor_dimensions(info, detector.shape)
         target_rows = np.flatnonzero(catalog_magnitudes <= maximum_g)
@@ -3422,7 +4156,8 @@ def match_local_bright_stars(
                 # It fills only the image area for which ASTAP found no local tile.
                 projected.setdefault(
                     int(row),
-                    (-2.0, float(x) / detector_scale_x, float(y) / detector_scale_y),
+                    (-2.0, (float(x) + 0.5) / detector_scale_x - 0.5,
+                     (float(y) + 0.5) / detector_scale_y - 0.5),
                 )
             if progress:
                 progress(
@@ -3433,14 +4168,21 @@ def match_local_bright_stars(
 
     recovered: list[RecoveredCatalogStar] = []
     recovered_xy = np.empty((0, 2), dtype=np.float64)
-    for row_index, (_edge_margin, expected_x, expected_y) in projected.items():
+    ordered_projections = list(projected.items())
+    if detection_tree is not None and ordered_projections:
+        expected = np.asarray([[value[1],value[2]] for _,value in ordered_projections])
+        distances, _ = detection_tree.query(expected, k=1)
+        ordered_projections = [ordered_projections[i] for i in np.argsort(distances, kind="stable")]
+    for row_index, (_edge_margin, expected_x, expected_y) in ordered_projections:
         if row_index in used_catalog_sources:
             continue
         ra = math.degrees(math.atan2(catalog_vectors[row_index, 1], catalog_vectors[row_index, 0])) % 360.0
         dec = math.degrees(math.asin(float(np.clip(catalog_vectors[row_index, 2], -1.0, 1.0))))
         if detection_tree is not None:
-            distance, det_id = detection_tree.query([expected_x, expected_y], k=1)
-            det_id = int(det_id)
+            distances, det_ids = detection_tree.query([expected_x, expected_y], k=2)
+            distance, det_id = float(distances[0]), int(det_ids[0])
+            if distance <= recovery_radius_px and distance >= 0.65*float(distances[1]):
+                continue
             if float(distance) <= recovery_radius_px and det_id not in used_detections:
                 matches[det_id] = CatalogMatch(
                     None, ra, dec, float(catalog_magnitudes[row_index]), None, None,
@@ -3488,6 +4230,66 @@ def match_local_bright_stars(
         ))
         recovered_xy = np.vstack((recovered_xy, [x, y]))
         used_catalog_sources.add(row_index)
+
+    # A first pass may have had too few direct detections for a global model.
+    # Local WCS-guided recoveries now add independently checked overlap points;
+    # fit once more and use the accepted SIP model to fill only still-unmapped
+    # catalogue rows. This is deliberately a prediction pass, so the UI can
+    # distinguish it from an observed SEP star.
+    if known_camera_projection is None and successful_tiles and matches:
+        merged_projection = _fit_global_sip_from_matches(
+            stars,
+            matches,
+            catalog_vectors,
+            detector.shape,
+            detector_scale_xy,
+            sky_mask,
+            info,
+            pixel_scale_arcsec,
+            progress,
+        )
+        if merged_projection is not None:
+            known_camera_projection = merged_projection
+            camera_projection = merged_projection
+            coverage_areas = (
+                CatalogCoverageArea(
+                    0.0,
+                    0.0,
+                    float(detector_width),
+                    float(detector_height),
+                    "merged local SIP projection",
+                ),
+                *local_coverage_areas,
+            )
+            sensor_width_mm, sensor_height_mm, _focal_mm = _sensor_dimensions(
+                info, detector.shape
+            )
+            target_rows = np.flatnonzero(catalog_magnitudes <= maximum_g)
+            if len(target_rows):
+                projected_pixels, z = _project_camera_catalog(
+                    catalog_vectors[target_rows],
+                    merged_projection,
+                    solver_width,
+                    solver_height,
+                    sensor_width_mm,
+                    sensor_height_mm,
+                )
+                full_x, full_y = projected_pixels[:, 0], projected_pixels[:, 1]
+                inside = (
+                    np.isfinite(projected_pixels).all(axis=1)
+                    & np.isfinite(z)
+                    & (z > 1e-6)
+                    & (full_x >= -recovery_radius_px * detector_scale_x)
+                    & (full_x <= solver_width + recovery_radius_px * detector_scale_x)
+                    & (full_y >= -recovery_radius_px * detector_scale_y)
+                    & (full_y <= solver_height + recovery_radius_px * detector_scale_y)
+                )
+                for row, x, y in zip(target_rows[inside], full_x[inside], full_y[inside]):
+                    projected.setdefault(
+                        int(row),
+                        (-2.0, (float(x) + 0.5) / detector_scale_x - 0.5,
+                         (float(y) + 0.5) / detector_scale_y - 0.5),
+                    )
     catalog_positions: dict[int, CatalogPosition] = {}
     for detector_id, match in matches.items():
         row_index = match.catalog_row_index
